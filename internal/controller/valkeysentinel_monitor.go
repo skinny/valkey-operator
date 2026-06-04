@@ -103,11 +103,18 @@ func (r *ValkeySentinelReconciler) reconcileMonitoring(ctx context.Context, s *v
 			// topology changes (failover, replica discovery, etc.)
 			// itself via INFO + gossip. The operator only sets the
 			// initial IP and the tuning knobs.
-			if !currentlyMonitored[v.Name] {
-				if err := c.Monitor(ctx, v.Name, entryIP, DefaultPort, quorum); err != nil {
-					log.V(1).Info("SENTINEL MONITOR failed", "addr", c.Addr(), "valkey", v.Name, "err", err)
-					continue
-				}
+			//
+			// SET is also one-shot. Every SENTINEL SET triggers a
+			// CONFIG REWRITE + fsync on the sentinel, and chatter
+			// from the operator during a failover can starve the
+			// sentinel timer enough to trip TILT mode. Treat the
+			// initial MONITOR as the only time we push auth + config.
+			if currentlyMonitored[v.Name] {
+				continue
+			}
+			if err := c.Monitor(ctx, v.Name, entryIP, DefaultPort, quorum); err != nil {
+				log.V(1).Info("SENTINEL MONITOR failed", "addr", c.Addr(), "valkey", v.Name, "err", err)
+				continue
 			}
 			if err := c.Set(ctx, v.Name, "auth-user", authUser); err != nil {
 				log.V(1).Info("SENTINEL SET auth-user failed", "addr", c.Addr(), "valkey", v.Name, "err", err)

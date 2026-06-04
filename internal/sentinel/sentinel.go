@@ -143,15 +143,15 @@ func (c *Client) Masters(ctx context.Context) ([]string, error) {
 	}
 	out := make([]string, 0, len(rows))
 	for _, row := range rows {
-		pairs, err := row.AsStrSlice()
+		// SENTINEL MASTERS returns each entry as a key-value
+		// structure. In RESP2 that's a flat array; in RESP3
+		// valkey-server returns it as a Map. AsStrMap handles both.
+		fields, err := row.AsStrMap()
 		if err != nil {
 			continue
 		}
-		for i := 0; i+1 < len(pairs); i += 2 {
-			if pairs[i] == "name" {
-				out = append(out, pairs[i+1])
-				break
-			}
+		if name := fields["name"]; name != "" {
+			out = append(out, name)
 		}
 	}
 	return out, nil
