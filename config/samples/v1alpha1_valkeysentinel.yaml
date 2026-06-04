@@ -1,0 +1,33 @@
+apiVersion: valkey.io/v1alpha1
+kind: ValkeySentinel
+metadata:
+  name: monitors
+spec:
+  # Minimum 3 so a single pod loss does not break quorum.
+  replicas: 3
+  # Selects every Valkey in this namespace with the matching label.
+  valkeySelector:
+    matchLabels:
+      tier: caching
+  # SENTINEL SET options pushed to every monitored master.
+  config:
+    down-after-milliseconds: "30000"
+    failover-timeout: "180000"
+    parallel-syncs: "1"
+  resources:
+    requests:
+      memory: "64Mi"
+      cpu: "50m"
+    limits:
+      memory: "128Mi"
+      cpu: "250m"
+  affinity:
+    podAntiAffinity:
+      preferredDuringSchedulingIgnoredDuringExecution:
+        - weight: 100
+          podAffinityTerm:
+            labelSelector:
+              matchLabels:
+                app.kubernetes.io/name: valkey
+                valkey.io/sentinel: monitors
+            topologyKey: kubernetes.io/hostname

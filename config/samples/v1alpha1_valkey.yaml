@@ -1,0 +1,19 @@
+apiVersion: valkey.io/v1alpha1
+kind: Valkey
+metadata:
+  name: cache
+  labels:
+    tier: caching   # picked up by the sample ValkeySentinel below
+spec:
+  # 0 = standalone (1 pod). N = 1 primary + N replicas.
+  replicas: 2
+  config:
+    maxmemory: 50mb
+    maxmemory-policy: allkeys-lfu
+  resources:
+    requests:
+      memory: "256Mi"
+      cpu: "100m"
+    limits:
+      memory: "512Mi"
+      cpu: "500m"
