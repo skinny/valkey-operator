@@ -83,7 +83,10 @@ var _ = Describe("Valkey controller", func() {
 			Expect(k8sClient.Get(ctx, client.ObjectKey{Name: GetServerConfigMapName(name), Namespace: "default"}, cm)).To(Succeed())
 			Expect(cm.Data).To(HaveKey(configFileKey))
 			Expect(cm.Data[configFileKey]).To(ContainSubstring("cluster-enabled no"))
-			Expect(cm.Data[configFileKey]).To(ContainSubstring("masteruser " + operatorUser))
+			Expect(cm.Data[configFileKey]).To(ContainSubstring("aclfile /config/users/" + aclFilename))
+			// Replication auth uses the default (open) user, matching
+			// ValkeyCluster - so masteruser is intentionally absent.
+			Expect(cm.Data[configFileKey]).NotTo(ContainSubstring("masteruser"))
 
 			aclSecret := &corev1.Secret{}
 			Expect(k8sClient.Get(ctx, client.ObjectKey{Name: getInternalSecretName(name), Namespace: "default"}, aclSecret)).To(Succeed())
