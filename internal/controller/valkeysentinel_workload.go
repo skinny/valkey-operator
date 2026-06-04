@@ -238,7 +238,19 @@ func (r *ValkeySentinelReconciler) upsertSentinelStatefulSet(ctx context.Context
 							},
 						}},
 						{Name: sentinelDataVolumeName, VolumeSource: corev1.VolumeSource{
-							EmptyDir: &corev1.EmptyDirVolumeSource{},
+							// Memory-backed (tmpfs). sentinel.conf is rewritten +
+							// fsynced on every gossip update, vote, and state
+							// transition during a failover - on a kind cluster
+							// (Docker Desktop VM) each fsync can take hundreds of
+							// ms, easily stalling the sentinel timer past
+							// SENTINEL_TILT_TRIGGER (2s) and wedging promotion.
+							// Backing the volume with tmpfs makes fsync a no-op.
+							// State loss on pod restart is fine: the startup
+							// script re-renders the base config from the
+							// ConfigMap template, the operator re-issues
+							// MONITOR+SET on the next reconcile, and gossip
+							// repopulates peers.
+							EmptyDir: &corev1.EmptyDirVolumeSource{Medium: corev1.StorageMediumMemory},
 						}},
 					},
 				},
