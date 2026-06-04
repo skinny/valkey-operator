@@ -200,6 +200,11 @@ const (
 	ConditionSlotsAssigned  = "SlotsAssigned"
 	ConditionPrimaryElected = "PrimaryElected"
 	ConditionMonitored      = "Monitored"
+	// ConditionBootstrapped is set on a Valkey once the operator has
+	// completed the one-shot initial REPLICAOF wiring. Once True it is
+	// never set False again - the operator stays hands-off so that
+	// sentinel-initiated failovers don't fight against re-bootstrap.
+	ConditionBootstrapped = "Bootstrapped"
 )
 
 const (

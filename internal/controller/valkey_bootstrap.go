@@ -23,18 +23,30 @@ import (
 	"strings"
 
 	vclient "github.com/valkey-io/valkey-go"
+	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	valkeyiov1alpha1 "valkey.io/valkey-operator/api/v1alpha1"
 )
 
 // bootstrapReplication performs the one-shot initial REPLICAOF wiring:
-// node-0 becomes primary, every other node REPLICAOFs node-0. The
-// controller stops issuing REPLICAOF as soon as any node reports a
-// non-empty master_host - after that, Sentinel (if monitoring) is the
-// source of truth.
+// node-0 becomes primary, every other node REPLICAOFs node-0. Once it
+// has succeeded the Bootstrapped condition is set and this function
+// becomes a no-op for the lifetime of the Valkey CR. After that,
+// Sentinel (if monitoring) is the only authority on the topology -
+// the operator never re-wires, so a sentinel-initiated failover
+// won't be fought by a stale "bootstrap" loop.
 func (r *ValkeyReconciler) bootstrapReplication(ctx context.Context, valkey *valkeyiov1alpha1.Valkey, nodes *valkeyiov1alpha1.ValkeyNodeList) error {
 	log := logf.FromContext(ctx)
+
+	// Sticky one-shot guard. Set on first successful bootstrap and
+	// never cleared - even pod restarts (which lose REPLICAOF in-memory
+	// state) do not retrigger bootstrap. Recovery from that scenario
+	// is Sentinel's job, or manual.
+	if meta.IsStatusConditionTrue(valkey.Status.Conditions, valkeyiov1alpha1.ConditionBootstrapped) {
+		return nil
+	}
 
 	primary, replicas := splitNodesByIndex(nodes)
 	if primary == nil || primary.Status.PodIP == "" || !primary.Status.Ready {
@@ -49,19 +61,6 @@ func (r *ValkeyReconciler) bootstrapReplication(ctx context.Context, valkey *val
 	operatorPassword, err := fetchSystemUserPassword(ctx, operatorUser, r.Client, valkey.Name, valkey.Namespace)
 	if err != nil {
 		return fmt.Errorf("fetch operator password: %w", err)
-	}
-
-	// Check whether any replica already reports a master_link. If so,
-	// the initial wiring already happened; do nothing.
-	for _, replica := range replicas {
-		info, err := infoReplication(ctx, replica.Status.PodIP, operatorPassword)
-		if err != nil {
-			continue
-		}
-		if strings.TrimSpace(info["master_host"]) != "" {
-			log.V(1).Info("bootstrap skipped: replica already wired", "replica", replica.Name)
-			return nil
-		}
 	}
 
 	log.Info("bootstrapping replication", "primary", primary.Name)
@@ -80,6 +79,9 @@ func (r *ValkeyReconciler) bootstrapReplication(ctx context.Context, valkey *val
 	}
 	r.Recorder.Eventf(valkey, primary, "Normal", "ReplicationBootstrapped", "Bootstrap",
 		"Initial primary is %s; %d replica(s) wired", primary.Name, len(replicas))
+	r.setCondition(valkey, valkeyiov1alpha1.ConditionBootstrapped, "BootstrapComplete",
+		fmt.Sprintf("Initial REPLICAOF wiring complete (primary: %s)", primary.Name),
+		metav1.ConditionTrue)
 	return nil
 }
 
