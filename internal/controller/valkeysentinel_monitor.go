@@ -19,7 +19,9 @@ package controller
 import (
 	"context"
 	"fmt"
+	"strings"
 
+	vclient "github.com/valkey-io/valkey-go"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	klabels "k8s.io/apimachinery/pkg/labels"
@@ -84,17 +86,23 @@ func (r *ValkeySentinelReconciler) reconcileMonitoring(ctx context.Context, s *v
 	quorum := int(s.Spec.EffectiveQuorum())
 	monitored := []string{}
 	for _, v := range matched {
-		entryIP, err := r.pickEntryIP(ctx, v)
-		if err != nil {
-			log.V(1).Info("no reachable data pod yet; skipping", "valkey", v.Name, "err", err)
-			continue
-		}
 		authUser, authPass, err := r.readSentinelAuth(ctx, v)
 		if err != nil {
 			log.V(1).Info("sentinel-auth secret unavailable; skipping", "valkey", v.Name, "err", err)
 			continue
 		}
+		entryIP, err := r.pickMasterEntryIP(ctx, v, authUser, authPass)
+		if err != nil {
+			log.V(1).Info("no reachable data pod yet; skipping", "valkey", v.Name, "err", err)
+			continue
+		}
 		for _, c := range sentinelClients {
+			// Per the standard Sentinel model, MONITOR is a one-shot
+			// registration. Once a sentinel knows about a master, the
+			// operator does not override its view - sentinel manages
+			// topology changes (failover, replica discovery, etc.)
+			// itself via INFO + gossip. The operator only sets the
+			// initial IP and the tuning knobs.
 			if !currentlyMonitored[v.Name] {
 				if err := c.Monitor(ctx, v.Name, entryIP, DefaultPort, quorum); err != nil {
 					log.V(1).Info("SENTINEL MONITOR failed", "addr", c.Addr(), "valkey", v.Name, "err", err)
@@ -184,10 +192,19 @@ func (r *ValkeySentinelReconciler) matchedValkeys(ctx context.Context, s *valkey
 	return out, nil
 }
 
-// pickEntryIP picks any reachable data pod IP for SENTINEL MONITOR.
-// Sentinel itself follows INFO replication from there to find the
-// actual master. We do NOT read Valkey.status.primaryPodName.
-func (r *ValkeySentinelReconciler) pickEntryIP(ctx context.Context, v *valkeyiov1alpha1.Valkey) (string, error) {
+// pickMasterEntryIP picks the IP of the data pod currently reporting
+// role:master, so SENTINEL MONITOR is given the actual primary. In
+// practice Sentinel does NOT gracefully follow master_host when handed
+// a replica IP - it marks the configured master s_down and gets stuck.
+// We probe each pod's role directly via INFO replication using the
+// _sentinel credentials (no read of Valkey.status; this is independent
+// observation, not cross-CR state reliance).
+//
+// Falls back to any reachable pod IP if none reports role:master
+// (e.g. transient state during initial bring-up). Sentinel will mark
+// the master s_down briefly until a primary settles, which is
+// preferable to refusing to issue MONITOR at all.
+func (r *ValkeySentinelReconciler) pickMasterEntryIP(ctx context.Context, v *valkeyiov1alpha1.Valkey, authUser, authPass string) (string, error) {
 	pods := &corev1.PodList{}
 	if err := r.List(ctx, pods,
 		client.InNamespace(v.Namespace),
@@ -195,13 +212,54 @@ func (r *ValkeySentinelReconciler) pickEntryIP(ctx context.Context, v *valkeyiov
 	); err != nil {
 		return "", err
 	}
+	var fallback string
 	for i := range pods.Items {
 		p := &pods.Items[i]
-		if p.Status.PodIP != "" {
+		if p.Status.PodIP == "" {
+			continue
+		}
+		if fallback == "" {
+			fallback = p.Status.PodIP
+		}
+		role, err := dataPodRole(ctx, p.Status.PodIP, authUser, authPass)
+		if err != nil {
+			continue
+		}
+		if role == "master" {
 			return p.Status.PodIP, nil
 		}
 	}
+	if fallback != "" {
+		return fallback, nil
+	}
 	return "", fmt.Errorf("no data pod has a PodIP yet")
+}
+
+// dataPodRole returns the value of the `role` line in INFO replication
+// (either "master" or "slave"). Authenticates with the _sentinel user
+// since that's the only credential the sentinel controller holds.
+func dataPodRole(ctx context.Context, ip, user, password string) (string, error) {
+	c, err := vclient.NewClient(vclient.ClientOption{
+		InitAddress:       []string{fmt.Sprintf("%s:%d", ip, DefaultPort)},
+		ForceSingleClient: true,
+		Username:          user,
+		Password:          password,
+	})
+	if err != nil {
+		return "", err
+	}
+	defer c.Close()
+	raw, err := c.Do(ctx, c.B().Info().Section("replication").Build()).ToString()
+	if err != nil {
+		return "", err
+	}
+	for line := range strings.SplitSeq(raw, "\n") {
+		line = strings.TrimSpace(line)
+		if k, val, ok := strings.Cut(line, ":"); ok && k == "role" {
+			return strings.TrimSpace(val), nil
+		}
+	}
+	return "", nil
 }
 
 // readSentinelAuth reads the per-Valkey <name>-sentinel-auth Secret.
