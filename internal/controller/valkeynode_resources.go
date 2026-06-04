@@ -39,6 +39,7 @@ func valkeyNodeLabels(node *valkeyiov1alpha1.ValkeyNode) map[string]string {
 	l := baseLabels(node.Name, "valkey-node")
 	for _, key := range []string{
 		LabelCluster,
+		LabelValkey,
 		LabelShardIndex,
 		LabelNodeIndex,
 	} {
