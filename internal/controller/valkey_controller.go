@@ -93,6 +93,19 @@ func (r *ValkeyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		return ctrl.Result{}, err
 	}
 
+	// Observe selecting ValkeySentinels early so status.monitoredBy is
+	// populated even while ValkeyNodes are still being provisioned.
+	monitoredBy, err := r.listSelectingSentinels(ctx, valkey)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	valkey.Status.MonitoredBy = monitoredBy
+	if len(monitoredBy) > 1 {
+		r.Recorder.Eventf(valkey, nil, corev1.EventTypeWarning,
+			"MultipleSentinelsSelecting", "Observe",
+			"More than one ValkeySentinel selects this Valkey: %v - last-applied SENTINEL SET wins", monitoredBy)
+	}
+
 	if requeue, err := r.reconcileNodes(ctx, valkey); err != nil {
 		r.setCondition(valkey, valkeyiov1alpha1.ConditionReady, "ValkeyNodeError", err.Error(), metav1.ConditionFalse)
 		_ = r.updateStatus(ctx, valkey)
@@ -115,17 +128,6 @@ func (r *ValkeyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 			_ = r.updateStatus(ctx, valkey)
 			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 		}
-	}
-
-	monitoredBy, err := r.listSelectingSentinels(ctx, valkey)
-	if err != nil {
-		return ctrl.Result{}, err
-	}
-	valkey.Status.MonitoredBy = monitoredBy
-	if len(monitoredBy) > 1 {
-		r.Recorder.Eventf(valkey, nil, corev1.EventTypeWarning,
-			"MultipleSentinelsSelecting", "Observe",
-			"More than one ValkeySentinel selects this Valkey: %v - last-applied SENTINEL SET wins", monitoredBy)
 	}
 
 	primaryName, primaryIP := r.observePrimary(ctx, valkey, nodes)

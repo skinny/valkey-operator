@@ -2,12 +2,16 @@
 
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://www.apache.org/licenses/LICENSE-2.0)
 
-A Kubernetes operator for deploying Valkey Clusters and managing their lifecycle.
+A Kubernetes operator for deploying Valkey deployments and managing their lifecycle.
 
 ## Description
 
-Valkey Operator is a Kubernetes operator that automates the deployment and management of [Valkey](https://valkey.io/), a high-performance data structure server that primarily serves key/value workloads.
-The operator simplifies deploying Valkey Clusters on Kubernetes, handling scaling, rolling upgrades, failover, TLS, and access control automatically.
+Valkey Operator is a Kubernetes operator that automates the deployment and management of [Valkey](https://valkey.io/), a high-performance data structure server that primarily serves key/value workloads. The operator supports two deployment topologies:
+
+- **[ValkeyCluster](./docs/valkeycluster.md)** - Valkey in cluster mode with sharding, automatic slot management, rolling upgrades, and proactive failover.
+- **[Valkey](./docs/valkey.md)** + **[ValkeySentinel](./docs/valkeysentinel.md)** - A non-sharded primary/replicas data plane monitored by an independently-sized Sentinel set. The sentinel set picks its targets via a label selector and a single sentinel set can monitor many `Valkey` resources.
+
+Both topologies handle scaling, rolling upgrades, TLS, and ACL-based access control automatically.
 
 > **⚠️ EARLY DEVELOPMENT NOTICE**
 >
