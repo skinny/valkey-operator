@@ -99,7 +99,10 @@ spec:
     parallel-syncs: "1"
   resources:
     requests: {memory: 64Mi, cpu: 50m}
-    limits:   {memory: 128Mi, cpu: 250m}
+    limits:   {memory: 128Mi}
+    # No CPU limit: CFS throttling at a tight quota easily produces >2s
+    # iteration pauses and trips Sentinel's TILT detector, which would
+    # wedge failover in wait_promotion. Sentinel idles at near-zero CPU.
 ```
 
 `spec.config` is global to every monitored master in this MVP.

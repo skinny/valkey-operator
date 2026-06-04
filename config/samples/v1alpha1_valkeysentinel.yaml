@@ -15,12 +15,17 @@ spec:
     failover-timeout: "180000"
     parallel-syncs: "1"
   resources:
+    # No CPU limit on purpose: Sentinel's 10Hz timer trips TILT mode if two
+    # consecutive iterations are >2s apart, and the Linux CFS throttler at a
+    # low CPU limit (e.g. 250m / 25ms per 100ms window) can easily produce
+    # that pause during disk fsyncs of sentinel.conf or sentinel-to-pod
+    # connects, wedging failover in wait_promotion. Sentinel idles at
+    # near-zero CPU; let it burst when it needs to.
     requests:
       memory: "64Mi"
       cpu: "50m"
     limits:
       memory: "128Mi"
-      cpu: "250m"
   affinity:
     podAntiAffinity:
       preferredDuringSchedulingIgnoredDuringExecution:
