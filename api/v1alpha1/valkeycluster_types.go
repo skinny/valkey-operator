@@ -193,11 +193,13 @@ type ValkeyClusterStatus struct {
 }
 
 const (
-	ConditionReady         = "Ready"
-	ConditionProgressing   = "Progressing"
-	ConditionDegraded      = "Degraded"
-	ConditionClusterFormed = "ClusterFormed"
-	ConditionSlotsAssigned = "SlotsAssigned"
+	ConditionReady          = "Ready"
+	ConditionProgressing    = "Progressing"
+	ConditionDegraded       = "Degraded"
+	ConditionClusterFormed  = "ClusterFormed"
+	ConditionSlotsAssigned  = "SlotsAssigned"
+	ConditionPrimaryElected = "PrimaryElected"
+	ConditionMonitored      = "Monitored"
 )
 
 const (
