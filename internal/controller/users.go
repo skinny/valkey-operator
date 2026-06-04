@@ -61,9 +61,6 @@ var (
 			"+cluster|migrateslots",      // migrate slots between shards
 			"+info",                      // node info and replication status
 			"+replicaof",                 // initial REPLICAOF wiring (Valkey CR bootstrap)
-			"+config|set",                // CONFIG SET masterauth (Valkey CR bootstrap)
-			"+psync",                     // replica -> master PSYNC handshake when masteruser=_operator
-			"+replconf",                  // replica -> master REPLCONF (listening-port, capa, ack, etc.)
 		}, " "),
 		// the ACL rawstring for exporter is taken from the redis_exporter documentation: https://github.com/oliver006/redis_exporter#authenticating-with-redis
 		exporterUser: "-@all +@connection +memory -readonly +strlen +config|get +xinfo +pfcount -quit +zcard +type +xlen -readwrite -command +client -wait +scard +llen +hlen +get +eval +slowlog +cluster|info +cluster|slots +cluster|nodes -hello -echo +info +latency +scan -reset -auth -asking",

@@ -117,10 +117,18 @@ func renderValkeyConfig(valkey *valkeyiov1alpha1.Valkey) string {
 		"port":            strconv.Itoa(DefaultPort),
 		"dir":             "/data",
 		"cluster-enabled": "no",
-		"masteruser":      operatorUser,
 		"protected-mode":  "no",
 		"appendonly":      "yes",
 		"aclfile":         "/config/users/" + aclFilename,
+		// Deliberately no `masteruser` / `masterauth` here. Replicas
+		// authenticate to the master as the default (open) user,
+		// matching how ValkeyCluster handles inter-node auth. Using
+		// a named system user would require either persisting
+		// masterauth into the ConfigMap (leaking the password into a
+		// non-Secret resource) or running a startup script that
+		// rewrites the config from a mounted Secret on every pod
+		// boot. Both are deferred until we tighten the wider auth
+		// model.
 	}
 	maps.Copy(cfg, valkey.Spec.Config)
 	keys := make([]string, 0, len(cfg))

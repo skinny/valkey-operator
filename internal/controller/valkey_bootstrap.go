@@ -66,9 +66,6 @@ func (r *ValkeyReconciler) bootstrapReplication(ctx context.Context, valkey *val
 
 	log.Info("bootstrapping replication", "primary", primary.Name)
 	if err := withDataClient(primary.Status.PodIP, operatorPassword, func(c vclient.Client) error {
-		if err := c.Do(ctx, c.B().ConfigSet().ParameterValue().ParameterValue("masterauth", operatorPassword).Build()).Error(); err != nil {
-			return fmt.Errorf("CONFIG SET masterauth on primary: %w", err)
-		}
 		return c.Do(ctx, c.B().Replicaof().No().One().Build()).Error()
 	}); err != nil {
 		return fmt.Errorf("promote primary: %w", err)
@@ -76,9 +73,6 @@ func (r *ValkeyReconciler) bootstrapReplication(ctx context.Context, valkey *val
 	for _, replica := range replicas {
 		ip := replica.Status.PodIP
 		if err := withDataClient(ip, operatorPassword, func(c vclient.Client) error {
-			if err := c.Do(ctx, c.B().ConfigSet().ParameterValue().ParameterValue("masterauth", operatorPassword).Build()).Error(); err != nil {
-				return fmt.Errorf("CONFIG SET masterauth on %s: %w", ip, err)
-			}
 			return c.Do(ctx, c.B().Replicaof().Host(primary.Status.PodIP).Port(int64(DefaultPort)).Build()).Error()
 		}); err != nil {
 			return fmt.Errorf("REPLICAOF on %s: %w", ip, err)
