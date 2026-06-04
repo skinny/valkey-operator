@@ -119,6 +119,17 @@ func (r *ValkeyNodeReconciler) ensureWorkload(ctx context.Context, node *valkeyi
 // buildPodTemplateAnnotations assembles the annotations that must be present on
 // the pod template spec to trigger rolling updates when the ACL secret or the
 // server config changes.
+// aclSecretNameForNode returns the name of the ACL Secret to mount for
+// this ValkeyNode. Prefers the explicit spec.usersACLSecretName field
+// (set by parents like Valkey) and falls back to the legacy
+// label-based lookup keyed on valkey.io/cluster (set by ValkeyCluster).
+func aclSecretNameForNode(node *valkeyiov1alpha1.ValkeyNode) string {
+	if node.Spec.UsersACLSecretName != "" {
+		return node.Spec.UsersACLSecretName
+	}
+	return getInternalSecretName(node.Labels[LabelCluster])
+}
+
 func buildPodTemplateAnnotations(node *valkeyiov1alpha1.ValkeyNode, aclSecret *corev1.Secret) map[string]string {
 	annotations := map[string]string{
 		hashAnnotationKey: aclSecret.Annotations[hashAnnotationKey],
@@ -143,7 +154,7 @@ func (r *ValkeyNodeReconciler) ensureStatefulSet(ctx context.Context, node *valk
 		},
 	}
 	log.V(1).Info("getting internal secret", "node-labels", desired.Labels)
-	aclSecretName := getInternalSecretName(desired.Labels[LabelCluster])
+	aclSecretName := aclSecretNameForNode(node)
 	aclSecret := &corev1.Secret{}
 	err = r.Get(ctx, types.NamespacedName{
 		Name:      aclSecretName,
@@ -179,7 +190,7 @@ func (r *ValkeyNodeReconciler) ensureDeployment(ctx context.Context, node *valke
 		},
 	}
 	log.V(1).Info("getting internal secret", "node-labels", desired.Labels)
-	aclSecretName := getInternalSecretName(desired.Labels[LabelCluster])
+	aclSecretName := aclSecretNameForNode(node)
 	aclSecret := &corev1.Secret{}
 	err = r.Get(ctx, types.NamespacedName{
 		Name:      aclSecretName,

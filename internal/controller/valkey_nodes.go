@@ -82,6 +82,11 @@ func buildValkeyNode(valkey *valkeyiov1alpha1.Valkey, index int) *valkeyiov1alph
 		}
 	}
 	l[LabelValkey] = valkey.Name
+	// LabelCluster is reused as "parent CR name" by downstream resource
+	// builders (e.g. the metrics-exporter sidecar derives its password
+	// Secret name from this label). Set it to valkey.Name so the same
+	// builders work for Valkey-owned ValkeyNodes.
+	l[LabelCluster] = valkey.Name
 	l[LabelNodeIndex] = strconv.Itoa(index)
 
 	return &valkeyiov1alpha1.ValkeyNode{
