@@ -38,7 +38,15 @@ const (
 	// ValkeySentinel pods. Sentinels need to connect, query INFO/ROLE,
 	// receive pubsub messages on the sentinel channel, and (during a
 	// failover) issue REPLICAOF and CLIENT KILL against replicas.
-	sentinelUserACL = "-@all +@connection +ping +info +role +replicaof " +
+	//
+	// +slaveof is required in addition to +replicaof: Valkey treats the
+	// two as separate ACL entries even though they alias the same
+	// command, and Sentinel's failover code path sends the legacy
+	// SLAVEOF name on the wire (the +failover-state-send-slaveof-noone
+	// event isn't just naming - it's literally what gets transmitted).
+	// Without +slaveof, every sentinel-initiated failover hangs in
+	// wait_promotion until the failover-timeout fires.
+	sentinelUserACL = "-@all +@connection +ping +info +role +replicaof +slaveof " +
 		"+subscribe +psubscribe +publish +unsubscribe +punsubscribe " +
 		"+multi +exec +discard +command +client " +
 		"+config|get +config|rewrite +config|set " +
