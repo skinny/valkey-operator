@@ -27,10 +27,11 @@ import (
 	valkeyiov1alpha1 "valkey.io/valkey-operator/api/v1alpha1"
 )
 
-// reconcileNodes ensures one ValkeyNode CR exists per pod position
-// (1 primary + spec.replicas replicas). Updates are applied one at a
-// time; if any spec mutation lands, the function returns (true, nil)
-// so the caller requeues.
+// reconcileNodes ensures exactly (1 + spec.replicas) ValkeyNodes
+// exist. Creates/updates the desired positions and deletes any
+// existing ValkeyNode whose index falls outside the new range
+// (a scale-down). If any spec mutation lands the function returns
+// (true, nil) so the caller requeues.
 func (r *ValkeyReconciler) reconcileNodes(ctx context.Context, valkey *valkeyiov1alpha1.Valkey) (bool, error) {
 	total := 1 + int(valkey.Spec.Replicas)
 	for index := range total {
@@ -42,7 +43,38 @@ func (r *ValkeyReconciler) reconcileNodes(ctx context.Context, valkey *valkeyiov
 			return true, nil
 		}
 	}
+	if err := r.pruneExtraNodes(ctx, valkey, total); err != nil {
+		return false, err
+	}
 	return false, nil
+}
+
+// pruneExtraNodes deletes any ValkeyNode owned by this Valkey whose
+// node-index label is >= total (a stale node from a previous higher
+// spec.replicas). Best-effort: a stale node without a parseable label
+// is left alone for a human to inspect.
+func (r *ValkeyReconciler) pruneExtraNodes(ctx context.Context, valkey *valkeyiov1alpha1.Valkey, total int) error {
+	list, err := r.listOwnedNodes(ctx, valkey)
+	if err != nil {
+		return err
+	}
+	for i := range list.Items {
+		n := &list.Items[i]
+		idx, err := strconv.Atoi(n.Labels[LabelNodeIndex])
+		if err != nil || idx < total {
+			continue
+		}
+		// Deleting node-0 would tear down the primary; we never
+		// target it because scale-down floors at replicas: 0 which
+		// keeps a single primary (total=1).
+		if err := r.Delete(ctx, n); err != nil {
+			return err
+		}
+		r.Recorder.Eventf(valkey, n, corev1.EventTypeNormal,
+			"ValkeyNodeDeleted", "ScaleDown",
+			"Deleted ValkeyNode %s (spec.replicas shrunk)", n.Name)
+	}
+	return nil
 }
 
 func (r *ValkeyReconciler) reconcileNode(ctx context.Context, valkey *valkeyiov1alpha1.Valkey, index int) (bool, bool, error) {
