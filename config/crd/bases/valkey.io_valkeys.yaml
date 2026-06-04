@@ -27,6 +27,10 @@ spec:
       name: Primary
       priority: 1
       type: string
+    - description: ValkeySentinels currently monitoring this Valkey (empty = no failover)
+      jsonPath: .status.monitoredBy[*]
+      name: Sentinels
+      type: string
     - jsonPath: .metadata.creationTimestamp
       name: Age
       type: date

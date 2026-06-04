@@ -139,6 +139,7 @@ type ValkeyStatus struct {
 // +kubebuilder:printcolumn:name="State",type="string",JSONPath=".status.state"
 // +kubebuilder:printcolumn:name="Replicas",type="integer",JSONPath=".spec.replicas"
 // +kubebuilder:printcolumn:name="Primary",type="string",JSONPath=".status.primaryPodName",priority=1
+// +kubebuilder:printcolumn:name="Sentinels",type="string",JSONPath=".status.monitoredBy[*]",description="ValkeySentinels currently monitoring this Valkey (empty = no failover)"
 // +kubebuilder:printcolumn:name="Age",type="date",JSONPath=".metadata.creationTimestamp"
 type Valkey struct {
 	metav1.TypeMeta `json:",inline"`
