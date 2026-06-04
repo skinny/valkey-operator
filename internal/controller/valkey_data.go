@@ -120,7 +120,7 @@ func renderValkeyConfig(valkey *valkeyiov1alpha1.Valkey) string {
 		"masteruser":      operatorUser,
 		"protected-mode":  "no",
 		"appendonly":      "yes",
-		"aclfile":         "/users/" + aclFilename,
+		"aclfile":         "/config/users/" + aclFilename,
 	}
 	maps.Copy(cfg, valkey.Spec.Config)
 	keys := make([]string, 0, len(cfg))
