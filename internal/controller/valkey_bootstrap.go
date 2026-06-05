@@ -30,22 +30,45 @@ import (
 	valkeyiov1alpha1 "valkey.io/valkey-operator/api/v1alpha1"
 )
 
-// bootstrapReplication performs the one-shot initial REPLICAOF wiring:
-// node-0 becomes primary, every other node REPLICAOFs node-0. Once it
-// has succeeded the Bootstrapped condition is set and this function
-// becomes a no-op for the lifetime of the Valkey CR. After that,
-// Sentinel (if monitoring) is the only authority on the topology -
-// the operator never re-wires, so a sentinel-initiated failover
-// won't be fought by a stale "bootstrap" loop.
+// bootstrapReplication performs the initial REPLICAOF wiring: node-0
+// becomes primary, every other node REPLICAOFs node-0. Once it has
+// succeeded the Bootstrapped condition is set and this function is a
+// no-op while replication is in any healthy state. Sentinel (if
+// monitoring) is the authority on topology from then on - the operator
+// does not fight a sentinel-initiated failover by re-wiring.
+//
+// Re-bootstrap exception: if Bootstrapped is True but every data pod
+// reports `role:master` with no `connected_slaves`, the cluster has
+// suffered catastrophic loss (e.g. every pod restarted without
+// persistence). For Valkeys without persistence the re-bootstrap is
+// safe (there is no data to overwrite); for Valkeys with persistence
+// it is not, so we surface a Degraded condition instead and require
+// the operator to intervene.
 func (r *ValkeyReconciler) bootstrapReplication(ctx context.Context, valkey *valkeyiov1alpha1.Valkey, nodes *valkeyiov1alpha1.ValkeyNodeList) error {
 	log := logf.FromContext(ctx)
 
-	// Sticky one-shot guard. Set on first successful bootstrap and
-	// never cleared - even pod restarts (which lose REPLICAOF in-memory
-	// state) do not retrigger bootstrap. Recovery from that scenario
-	// is Sentinel's job, or manual.
-	if meta.IsStatusConditionTrue(valkey.Status.Conditions, valkeyiov1alpha1.ConditionBootstrapped) {
-		return nil
+	bootstrapped := meta.IsStatusConditionTrue(valkey.Status.Conditions, valkeyiov1alpha1.ConditionBootstrapped)
+	if bootstrapped {
+		needsRebootstrap, err := r.replicationCollapsed(ctx, valkey, nodes)
+		if err != nil {
+			return fmt.Errorf("check replication state: %w", err)
+		}
+		if !needsRebootstrap {
+			return nil
+		}
+		if valkey.Spec.Persistence != nil {
+			r.Recorder.Eventf(valkey, nil, "Warning", "ReplicationLost", "Bootstrap",
+				"All data pods report role:master with no replicas connected, but persistence is enabled; refusing to auto-rebootstrap (would discard replica RDBs). Manual intervention required.")
+			r.setCondition(valkey, valkeyiov1alpha1.ConditionDegraded,
+				"ReplicationLostWithPersistence",
+				"All data pods restarted with no replication wired; re-running bootstrap would discard the replicas' on-disk data. Clear status.conditions[Bootstrapped] to opt in to auto-rebootstrap, or wire REPLICAOF manually.",
+				metav1.ConditionTrue)
+			return nil
+		}
+		log.Info("re-bootstrapping after replication collapse (no persistence; safe to rewire)")
+		r.Recorder.Eventf(valkey, nil, "Warning", "ReplicationLost", "Bootstrap",
+			"All data pods report role:master with no replicas; re-running bootstrap")
+		meta.RemoveStatusCondition(&valkey.Status.Conditions, valkeyiov1alpha1.ConditionBootstrapped)
 	}
 
 	primary, replicas := splitNodesByIndex(nodes)
@@ -83,6 +106,57 @@ func (r *ValkeyReconciler) bootstrapReplication(ctx context.Context, valkey *val
 		fmt.Sprintf("Initial REPLICAOF wiring complete (primary: %s)", primary.Name),
 		metav1.ConditionTrue)
 	return nil
+}
+
+// replicationCollapsed reports true when every Ready data pod for this
+// Valkey reports role:master with zero connected replicas - the
+// catastrophic-loss signature we re-bootstrap from (full cluster
+// restart without persistence). Returns false if any pod is still
+// observing a slave link, if any pod is currently a slave with a live
+// master_link, or if we can't reach all pods (we only act on a
+// complete, confident picture).
+func (r *ValkeyReconciler) replicationCollapsed(ctx context.Context, valkey *valkeyiov1alpha1.Valkey, nodes *valkeyiov1alpha1.ValkeyNodeList) (bool, error) {
+	if valkey.Spec.Replicas == 0 {
+		return false, nil
+	}
+	primary, replicas := splitNodesByIndex(nodes)
+	if primary == nil || !primary.Status.Ready || primary.Status.PodIP == "" {
+		return false, nil
+	}
+	for _, rep := range replicas {
+		if !rep.Status.Ready || rep.Status.PodIP == "" {
+			return false, nil
+		}
+	}
+	password, err := fetchSystemUserPassword(ctx, operatorUser, r.Client, valkey.Name, valkey.Namespace)
+	if err != nil {
+		return false, fmt.Errorf("fetch operator password: %w", err)
+	}
+	check := func(ip string) (role string, connectedSlaves int, ok bool) {
+		info, err := infoReplication(ctx, ip, password)
+		if err != nil {
+			return "", 0, false
+		}
+		role = strings.TrimSpace(info["role"])
+		if v, err := strconv.Atoi(strings.TrimSpace(info["connected_slaves"])); err == nil {
+			connectedSlaves = v
+		}
+		return role, connectedSlaves, true
+	}
+	role, conn, ok := check(primary.Status.PodIP)
+	if !ok || role != "master" || conn != 0 {
+		return false, nil
+	}
+	for _, rep := range replicas {
+		role, _, ok := check(rep.Status.PodIP)
+		if !ok {
+			return false, nil
+		}
+		if role != "master" {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 // splitNodesByIndex returns the node with LabelNodeIndex=0 and every
