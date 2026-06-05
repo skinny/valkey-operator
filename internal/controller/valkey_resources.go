@@ -37,16 +37,29 @@ const (
 	// sentinelUserACL is the least-privilege ACL rule string used by the
 	// ValkeySentinel pods. Sentinels need to connect, query INFO/ROLE,
 	// receive pubsub messages on the sentinel channel, and (during a
-	// failover) issue REPLICAOF and CLIENT KILL against replicas.
+	// failover) reconfigure replication on the data nodes.
 	//
-	// +slaveof is required in addition to +replicaof: Valkey treats the
-	// two as separate ACL entries even though they alias the same
-	// command, and Sentinel's failover code path sends the legacy
-	// SLAVEOF name on the wire (the +failover-state-send-slaveof-noone
-	// event isn't just naming - it's literally what gets transmitted).
-	// Without +slaveof, every sentinel-initiated failover hangs in
-	// wait_promotion until the failover-timeout fires.
-	sentinelUserACL = "-@all +@connection +ping +info +role +replicaof +slaveof " +
+	// The failover-critical grants, all confirmed against Valkey 9.0 by
+	// reading the data node's ACL LOG during a hung failover:
+	//
+	//   +failover  Valkey 9.0 Sentinel's promotion is a MULTI/EXEC
+	//              transaction that issues the FAILOVER command on the
+	//              node being promoted (the coordinated-handoff command,
+	//              not a bare SLAVEOF NO ONE). A single denied command in
+	//              that MULTI aborts the whole transaction at EXEC, so the
+	//              queued SLAVEOF NO ONE never runs and the failover hangs
+	//              in wait_promotion until failover-timeout. Without
+	//              +failover the ACL LOG shows: reason=command
+	//              context=multi object=failover user=_sentinel.
+	//   +slaveof   Required in addition to +replicaof: Valkey treats the
+	//              two as separate ACL entries even though they alias the
+	//              same command, and Sentinel sends the legacy SLAVEOF
+	//              name on the wire.
+	//   +config|rewrite  The same promotion transaction calls CONFIG
+	//              REWRITE; it must also succeed on the wire (see the
+	//              writable-config copy in the ValkeyNode pod spec).
+	//   +client    The transaction ends with CLIENT KILL TYPE normal/pubsub.
+	sentinelUserACL = "-@all +@connection +ping +info +role +replicaof +slaveof +failover " +
 		"+subscribe +psubscribe +publish +unsubscribe +punsubscribe " +
 		"+multi +exec +discard +command +client " +
 		"+config|get +config|rewrite +config|set " +
