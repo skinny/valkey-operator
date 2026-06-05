@@ -75,8 +75,8 @@ func TestBuildValkeyNodePodTemplateSpec(t *testing.T) {
 	// Image
 	assert.Equal(t, "valkey/valkey:9.0.0", c.Image)
 
-	// Command
-	assert.Equal(t, []string{"valkey-server", "/config/valkey.conf"}, c.Command)
+	// Command - launched from the writable config copy so CONFIG REWRITE works.
+	assert.Equal(t, []string{"valkey-server", "/etc/valkey/valkey.conf"}, c.Command)
 
 	// Ports
 	require.Len(t, c.Ports, 2)
@@ -110,20 +110,29 @@ func TestBuildValkeyNodePodTemplateSpec(t *testing.T) {
 	assert.Contains(t, c.ReadinessProbe.Exec.Command, "/scripts/readiness-check.sh")
 
 	// VolumeMounts
-	require.Len(t, c.VolumeMounts, 2)
+	require.Len(t, c.VolumeMounts, 3)
 	assert.Equal(t, "scripts", c.VolumeMounts[0].Name)
 	assert.Equal(t, "/scripts", c.VolumeMounts[0].MountPath)
 	assert.Equal(t, "valkey-conf", c.VolumeMounts[1].Name)
 	assert.Equal(t, "/config", c.VolumeMounts[1].MountPath)
 	assert.True(t, c.VolumeMounts[1].ReadOnly, "valkey-conf mount should be read-only")
+	assert.Equal(t, writableConfigVolumeName, c.VolumeMounts[2].Name)
+	assert.Equal(t, writableConfigPath, c.VolumeMounts[2].MountPath)
+	assert.False(t, c.VolumeMounts[2].ReadOnly, "writable config mount must be writable")
 
 	// Volumes
-	require.Len(t, pts.Spec.Volumes, 2)
+	require.Len(t, pts.Spec.Volumes, 3)
 	assert.Equal(t, "scripts", pts.Spec.Volumes[0].Name)
 	assert.Equal(t, "valkey-config", pts.Spec.Volumes[0].ConfigMap.Name)
 	assert.Equal(t, int32(0755), *pts.Spec.Volumes[0].ConfigMap.DefaultMode)
 	assert.Equal(t, "valkey-conf", pts.Spec.Volumes[1].Name)
 	assert.Equal(t, "valkey-config", pts.Spec.Volumes[1].ConfigMap.Name)
+	assert.Equal(t, writableConfigVolumeName, pts.Spec.Volumes[2].Name)
+	require.NotNil(t, pts.Spec.Volumes[2].EmptyDir, "writable config volume must be an emptyDir")
+
+	// config-init populates the writable copy before the server starts.
+	require.Len(t, pts.Spec.InitContainers, 1)
+	assert.Equal(t, "config-init", pts.Spec.InitContainers[0].Name)
 }
 
 func TestBuildValkeyNodeDeployment(t *testing.T) {
@@ -368,15 +377,15 @@ func TestBuildValkeyNodePodTemplateSpec_WithPersistence(t *testing.T) {
 	pts, err := buildValkeyNodePodTemplateSpec(node, valkeyNodeLabels(node))
 	require.NoError(t, err)
 
-	require.Len(t, pts.Spec.Volumes, 3)
-	assert.Equal(t, dataVolumeName, pts.Spec.Volumes[2].Name)
-	require.NotNil(t, pts.Spec.Volumes[2].PersistentVolumeClaim)
-	assert.Equal(t, "valkey-mynode-data", pts.Spec.Volumes[2].PersistentVolumeClaim.ClaimName)
+	require.Len(t, pts.Spec.Volumes, 4)
+	assert.Equal(t, dataVolumeName, pts.Spec.Volumes[3].Name)
+	require.NotNil(t, pts.Spec.Volumes[3].PersistentVolumeClaim)
+	assert.Equal(t, "valkey-mynode-data", pts.Spec.Volumes[3].PersistentVolumeClaim.ClaimName)
 
 	server := pts.Spec.Containers[0]
-	require.Len(t, server.VolumeMounts, 3)
-	assert.Equal(t, dataVolumeName, server.VolumeMounts[2].Name)
-	assert.Equal(t, dataMountPath, server.VolumeMounts[2].MountPath)
+	require.Len(t, server.VolumeMounts, 4)
+	assert.Equal(t, dataVolumeName, server.VolumeMounts[3].Name)
+	assert.Equal(t, dataMountPath, server.VolumeMounts[3].MountPath)
 }
 
 func TestBuildContainersDef_DefaultImage(t *testing.T) {
@@ -563,17 +572,17 @@ func TestBuildValkeyNodePodTemplateSpec_WithACLSecret(t *testing.T) {
 	pts, err := buildValkeyNodePodTemplateSpec(node, valkeyNodeLabels(node))
 	require.NoError(t, err)
 
-	// Volumes: scripts, valkey-conf, users-acl
-	require.Len(t, pts.Spec.Volumes, 3)
-	aclVol := pts.Spec.Volumes[2]
+	// Volumes: scripts, valkey-conf, valkey-conf-writable, users-acl
+	require.Len(t, pts.Spec.Volumes, 4)
+	aclVol := pts.Spec.Volumes[3]
 	assert.Equal(t, "users-acl", aclVol.Name)
 	require.NotNil(t, aclVol.Secret)
 	assert.Equal(t, "mynode-internal", aclVol.Secret.SecretName)
 
 	// VolumeMounts on the server container (always Containers[0])
 	c := pts.Spec.Containers[0]
-	require.Len(t, c.VolumeMounts, 3)
-	aclMount := c.VolumeMounts[2]
+	require.Len(t, c.VolumeMounts, 4)
+	aclMount := c.VolumeMounts[3]
 	assert.Equal(t, "users-acl", aclMount.Name)
 	assert.Equal(t, "/config/users", aclMount.MountPath)
 	assert.True(t, aclMount.ReadOnly)
@@ -585,8 +594,8 @@ func TestBuildValkeyNodePodTemplateSpec_WithoutACLSecret(t *testing.T) {
 	pts, err := buildValkeyNodePodTemplateSpec(node, valkeyNodeLabels(node))
 	require.NoError(t, err)
 
-	require.Len(t, pts.Spec.Volumes, 2, "should only have scripts and valkey-conf volumes")
-	require.Len(t, pts.Spec.Containers[0].VolumeMounts, 2, "should only have scripts and valkey-conf mounts")
+	require.Len(t, pts.Spec.Volumes, 3, "should have scripts, valkey-conf, and writable-config volumes")
+	require.Len(t, pts.Spec.Containers[0].VolumeMounts, 3, "should have scripts, valkey-conf, and writable-config mounts")
 }
 
 func TestLivenessCheckScript(t *testing.T) {

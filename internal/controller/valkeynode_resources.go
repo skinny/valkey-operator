@@ -169,7 +169,13 @@ func buildContainersDef(node *valkeyiov1alpha1.ValkeyNode) ([]corev1.Container, 
 			Resources: node.Spec.Resources,
 			Command: []string{
 				"valkey-server",
-				"/config/valkey.conf",
+				// Run from a writable copy of the config (populated by the
+				// config-init initContainer). valkey.conf MUST live on a
+				// writable filesystem: CONFIG REWRITE - which Sentinel issues
+				// on every failover promotion, and which `CONFIG SET` +
+				// persistence rely on - fails with "Read-only file system" if
+				// the server is launched against the ConfigMap mount directly.
+				writableConfigPath + "/valkey.conf",
 			},
 			Ports: []corev1.ContainerPort{
 				{
@@ -239,6 +245,10 @@ func buildContainersDef(node *valkeyiov1alpha1.ValkeyNode) ([]corev1.Container, 
 					MountPath: "/config",
 					ReadOnly:  true,
 				},
+				{
+					Name:      writableConfigVolumeName,
+					MountPath: writableConfigPath,
+				},
 			},
 		},
 	}
@@ -289,11 +299,31 @@ func buildValkeyNodePodTemplateSpec(node *valkeyiov1alpha1.ValkeyNode, labels ma
 		configMapName = GetServerConfigMapName(node.Name)
 	}
 
+	image := DefaultImage
+	if node.Spec.Image != "" {
+		image = node.Spec.Image
+	}
+
 	podSpec := corev1.PodSpec{
 		Containers:   containers,
 		NodeSelector: node.Spec.NodeSelector,
 		Affinity:     node.Spec.Affinity,
 		Tolerations:  node.Spec.Tolerations,
+		// config-init copies the read-only ConfigMap valkey.conf into a
+		// writable emptyDir so the server can CONFIG REWRITE it. The
+		// ConfigMap remains the source of truth: on pod restart the copy
+		// is repopulated, so runtime rewrites are intentionally ephemeral.
+		InitContainers: []corev1.Container{
+			{
+				Name:    "config-init",
+				Image:   image,
+				Command: []string{"sh", "-c", "cp /config/valkey.conf " + writableConfigPath + "/valkey.conf"},
+				VolumeMounts: []corev1.VolumeMount{
+					{Name: "valkey-conf", MountPath: "/config", ReadOnly: true},
+					{Name: writableConfigVolumeName, MountPath: writableConfigPath},
+				},
+			},
+		},
 		Volumes: []corev1.Volume{
 			{
 				Name: "scripts",
@@ -314,6 +344,12 @@ func buildValkeyNodePodTemplateSpec(node *valkeyiov1alpha1.ValkeyNode, labels ma
 							Name: configMapName,
 						},
 					},
+				},
+			},
+			{
+				Name: writableConfigVolumeName,
+				VolumeSource: corev1.VolumeSource{
+					EmptyDir: &corev1.EmptyDirVolumeSource{},
 				},
 			},
 		},

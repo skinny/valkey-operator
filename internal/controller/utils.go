@@ -82,6 +82,12 @@ const (
 	tlsCertMountPath = "/tls"
 	dataVolumeName   = "data"
 	dataMountPath    = "/data"
+	// writableConfigVolumeName / writableConfigPath back a writable copy of
+	// valkey.conf. The server is launched from here (not the read-only
+	// ConfigMap mount) so CONFIG REWRITE - issued by Sentinel on every
+	// failover promotion - can succeed.
+	writableConfigVolumeName = "valkey-conf-writable"
+	writableConfigPath       = "/etc/valkey"
 	tlsSecretKeyCA   = "ca.crt"
 	tlsSecretKeyCert = "tls.crt"
 	tlsSecretKeyKey  = "tls.key"
