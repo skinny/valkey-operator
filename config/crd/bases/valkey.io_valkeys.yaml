@@ -2941,6 +2941,25 @@ spec:
                   type: string
                 type: array
                 x-kubernetes-list-type: set
+              primaryEndpoint:
+                description: |-
+                  PrimaryEndpoint is the network endpoint of the current primary,
+                  observed by the operator via INFO replication. Used by selecting
+                  ValkeySentinels so they can render `sentinel monitor` lines into
+                  their ConfigMap without re-probing every reconcile. Empty until
+                  the primary is observed.
+                properties:
+                  ip:
+                    description: IP is the IPv4/IPv6 address.
+                    type: string
+                  port:
+                    description: Port is the TCP port.
+                    format: int32
+                    type: integer
+                required:
+                - ip
+                - port
+                type: object
               primaryPodName:
                 description: |-
                   PrimaryPodName is the name of the pod currently reporting

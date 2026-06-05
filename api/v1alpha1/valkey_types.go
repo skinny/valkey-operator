@@ -91,6 +91,14 @@ type ValkeySpec struct {
 	PodDisruptionBudget PDBPolicy `json:"podDisruptionBudget,omitempty"`
 }
 
+// Endpoint is a host:port pair observed by the operator.
+type Endpoint struct {
+	// IP is the IPv4/IPv6 address.
+	IP string `json:"ip"`
+	// Port is the TCP port.
+	Port int32 `json:"port"`
+}
+
 // ValkeyStatus defines the observed state of Valkey.
 type ValkeyStatus struct {
 	// State summarises overall health.
@@ -110,6 +118,14 @@ type ValkeyStatus struct {
 	// `role:master`. Empty when no primary is known.
 	// +optional
 	PrimaryPodName string `json:"primaryPodName,omitempty"`
+
+	// PrimaryEndpoint is the network endpoint of the current primary,
+	// observed by the operator via INFO replication. Used by selecting
+	// ValkeySentinels so they can render `sentinel monitor` lines into
+	// their ConfigMap without re-probing every reconcile. Empty until
+	// the primary is observed.
+	// +optional
+	PrimaryEndpoint *Endpoint `json:"primaryEndpoint,omitempty"`
 
 	// ReadyReplicas is the number of pods other than the primary that
 	// report ready.

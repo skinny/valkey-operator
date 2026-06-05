@@ -103,7 +103,7 @@ func (r *ValkeyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	if len(monitoredBy) > 1 {
 		r.Recorder.Eventf(valkey, nil, corev1.EventTypeWarning,
 			"MultipleSentinelsSelecting", "Observe",
-			"More than one ValkeySentinel selects this Valkey: %v - last-applied SENTINEL SET wins", monitoredBy)
+			"More than one ValkeySentinel selects this Valkey: %v - each renders the master into its own ConfigMap; behaviour is undefined", monitoredBy)
 	}
 
 	if requeue, err := r.reconcileNodes(ctx, valkey); err != nil {
@@ -132,6 +132,11 @@ func (r *ValkeyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 
 	primaryName, primaryIP := r.observePrimary(ctx, valkey, nodes)
 	valkey.Status.PrimaryPodName = primaryName
+	if primaryIP != "" {
+		valkey.Status.PrimaryEndpoint = &valkeyiov1alpha1.Endpoint{IP: primaryIP, Port: int32(DefaultPort)}
+	} else {
+		valkey.Status.PrimaryEndpoint = nil
+	}
 	valkey.Status.ReadyReplicas = countReplicas(nodes, primaryIP)
 
 	r.deriveConditions(valkey, primaryName, monitoredBy)
