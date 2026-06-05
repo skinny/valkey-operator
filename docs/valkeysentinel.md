@@ -48,7 +48,7 @@ Every `Valkey` that ceases to match (e.g. a label was removed) gets
 `SENTINEL REMOVE`-d on the next reconcile - **immediately**, no grace
 period.
 
-### `config` (passthrough `SENTINEL SET`)
+### `config` (per-master tuning baked into the template)
 
 ```yaml
 config:
@@ -57,9 +57,19 @@ config:
   parallel-syncs: "1"
 ```
 
-The operator runs `SENTINEL SET <master> <key> <value>` against every
-monitored master with these settings. Global to all monitored masters
-in this MVP; per-master overrides are future work.
+These keys are written as `sentinel <key> <master> <value>` lines into
+the rendered `sentinel.conf` template for every monitored master, then
+materialized into the sentinel pods' working directory at boot.
+
+The operator does **not** issue `SENTINEL SET` against running
+sentinels in steady state - the ConfigMap is the source of truth. When
+the rendered content changes, a content-hash annotation on the
+StatefulSet pod template triggers a rolling restart (one pod at a
+time, respecting the PDB) so the new config reaches the pods without
+the burst of CONFIG REWRITE writes that can stall the sentinel timer.
+
+Global to all monitored masters in this version; per-master overrides
+are future work.
 
 ### `quorum` (optional)
 
@@ -74,16 +84,22 @@ monitors.
 
 ## How auth works
 
-Each `Valkey` that gets selected by a `ValkeySentinel` exposes a
-small `<name>-sentinel-auth` Secret containing the credentials for the
-`_sentinel` ACL user. The sentinel controller reads this Secret and
-pushes the username/password via `SENTINEL SET <master>
-auth-user/auth-pass` so the sentinels can authenticate to the data
-plane during INFO/REPLICAOF traffic.
+Each `Valkey` selected by a `ValkeySentinel` exposes a small
+`<name>-sentinel-auth` Secret containing the credentials for the
+`_sentinel` ACL user. The sentinel controller aggregates the passwords
+from every matched Valkey into a single `<sentinel-name>-auth` Secret,
+mounted read-only at `/sentinel-auth/` in every sentinel pod (one file
+per Valkey, keyed by the Valkey name).
 
-If multiple `ValkeySentinel`s select the same `Valkey`, last-applied
-`SENTINEL SET` wins. The Valkey emits a `MultipleSentinelsSelecting`
-warning event so this is visible.
+The rendered `sentinel.conf` carries a `__SENTINEL_AUTH_PASS_<name>__`
+placeholder. The startup script substitutes each placeholder with the
+contents of the matching file at pod start, so the password is never
+written to a ConfigMap or pod environment variable.
+
+If multiple `ValkeySentinel`s select the same `Valkey`, each renders
+its own copy of the master into its own ConfigMap. The Valkey emits a
+`MultipleSentinelsSelecting` warning event so the situation is
+visible; behaviour is undefined.
 
 ## Status
 
@@ -125,7 +141,7 @@ graph TD
     S -.->|spec.valkeySelector matches| V2
     S -.->|spec.valkeySelector matches| V3
 
-    SP -.->|"SENTINEL MONITOR cache-A"| V1
-    SP -.->|"SENTINEL MONITOR cache-B"| V2
-    SP -.->|"SENTINEL MONITOR cache-C"| V3
+    SP -.->|"sentinel monitor cache-A (from ConfigMap)"| V1
+    SP -.->|"sentinel monitor cache-B (from ConfigMap)"| V2
+    SP -.->|"sentinel monitor cache-C (from ConfigMap)"| V3
 ```

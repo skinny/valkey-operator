@@ -105,7 +105,9 @@ func (r *ValkeyReconciler) upsertValkeyACLSecret(ctx context.Context, valkey *va
 
 // projectSentinelAuthSecret writes a small `<name>-sentinel-auth` Secret
 // containing only the `_sentinel` user credentials. Selecting
-// ValkeySentinels read this Secret to push `SENTINEL SET auth-user/auth-pass`.
+// ValkeySentinels read this Secret to bake `sentinel auth-user/auth-pass`
+// directly into their rendered sentinel.conf (the password is substituted
+// at pod start from the per-sentinel aggregated auth Secret).
 // Skipped when the Valkey is standalone (no sentinel monitoring possible).
 func (r *ValkeyReconciler) projectSentinelAuthSecret(ctx context.Context, valkey *valkeyiov1alpha1.Valkey, pwSecret *corev1.Secret) error {
 	if valkey.Spec.Replicas == 0 {

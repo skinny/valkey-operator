@@ -41,17 +41,19 @@ import (
 // ValkeySentinelReconciler reconciles a ValkeySentinel object.
 //
 // Pipeline:
-//  1. Provision sentinel infrastructure (Service, ConfigMap, PDB,
-//     StatefulSet).
-//  2. List Valkeys whose labels match spec.valkeySelector.
-//  3. For each matched Valkey: SENTINEL MONITOR + SET (using the
-//     per-Valkey sentinel-auth Secret); for masters no longer matched:
-//     SENTINEL REMOVE.
-//  4. Update status (readyReplicas, monitored).
-//
-// The reconciler does NOT read Valkey.status. It picks any reachable
-// data pod (by label) as the entry IP for SENTINEL MONITOR; Sentinel
-// itself follows INFO replication to discover the actual master.
+//  1. Provision sentinel infrastructure (Service, PDB).
+//  2. Gather per-Valkey monitor configs from Valkey.status.primaryEndpoint
+//     (populated by the Valkey controller). One matched Valkey == one
+//     monitor block in the rendered sentinel.conf.
+//  3. Maintain the aggregated `<sentinel-name>-auth` Secret with one
+//     key per matched Valkey, mounted at /sentinel-auth/ in each pod.
+//  4. Render the ConfigMap with `sentinel monitor` + auth + tuning baked
+//     in; stamp the content hash as a pod-template annotation so the
+//     StatefulSet rolls when the rendered config changes.
+//  5. Reconcile the StatefulSet.
+//  6. For masters a running sentinel still knows about that are not in
+//     the matched set: SENTINEL REMOVE.
+//  7. Update status (readyReplicas, monitored).
 type ValkeySentinelReconciler struct {
 	client.Client
 	Scheme   *runtime.Scheme
@@ -62,6 +64,11 @@ type ValkeySentinelReconciler struct {
 // +kubebuilder:rbac:groups=valkey.io,resources=valkeysentinels/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=valkey.io,resources=valkeys,verbs=get;list;watch
 // +kubebuilder:rbac:groups=apps,resources=statefulsets,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
+// +kubebuilder:rbac:groups=policy,resources=poddisruptionbudgets,verbs=get;list;watch;create;update;patch;delete
 
 func (r *ValkeySentinelReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
@@ -75,24 +82,43 @@ func (r *ValkeySentinelReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	if err := r.upsertSentinelService(ctx, sentinel); err != nil {
 		return ctrl.Result{}, err
 	}
-	if err := r.upsertSentinelConfigMap(ctx, sentinel); err != nil {
-		return ctrl.Result{}, err
-	}
 	if err := r.upsertSentinelPDB(ctx, sentinel); err != nil {
 		return ctrl.Result{}, err
 	}
-	ss, err := r.upsertSentinelStatefulSet(ctx, sentinel)
+
+	// Gather per-Valkey monitor blocks from Valkey.status.primaryEndpoint
+	// (set by the Valkey controller). This is the single source of truth
+	// for what gets baked into the template; no data-pod probing here.
+	monitors, passwords, err := r.collectMonitorConfigs(ctx, sentinel)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	if err := r.upsertSentinelAuthSecret(ctx, sentinel, passwords); err != nil {
+		return ctrl.Result{}, err
+	}
+	configHash, err := r.upsertSentinelConfigMap(ctx, sentinel, monitors)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	ss, err := r.upsertSentinelStatefulSet(ctx, sentinel, configHash)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
 	sentinel.Status.ReadyReplicas = ss.Status.ReadyReplicas
 
-	// Sentinel-side monitoring: only attempt when at least one pod is ready.
+	// REMOVE-only sweep against running sentinels for masters no longer
+	// in the matched set. Monitor + auth + tuning are now in the
+	// template; no SETs over the wire.
 	monitored := []string{}
 	if ss.Status.ReadyReplicas > 0 {
-		monitored, err = r.reconcileMonitoring(ctx, sentinel)
+		monitored, err = r.reconcileMonitoring(ctx, sentinel, monitors)
 		if err != nil {
 			log.V(1).Info("monitoring reconcile incomplete; will retry", "err", err)
+		}
+	} else {
+		for _, m := range monitors {
+			monitored = append(monitored, m.Name)
 		}
 	}
 	sort.Strings(monitored)

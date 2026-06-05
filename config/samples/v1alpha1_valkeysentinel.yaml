@@ -9,7 +9,11 @@ spec:
   valkeySelector:
     matchLabels:
       tier: caching
-  # SENTINEL SET options pushed to every monitored master.
+  # Per-master tuning baked into the rendered sentinel.conf for every
+  # monitored master. The operator never issues SENTINEL SET against
+  # running sentinels in steady state - the template is the source of
+  # truth, and a config-hash annotation triggers a rolling restart
+  # when the rendered content changes.
   config:
     down-after-milliseconds: "30000"
     failover-timeout: "180000"

@@ -143,20 +143,26 @@ wiring. Period.
    and a `sentinel.conf` template (no `sentinel monitor` directives),
    PDB, and the StatefulSet running `spec.replicas` sentinel pods.
 2. List Valkeys matching `spec.valkeySelector`.
-3. For each matched Valkey:
-   - Pick an entry IP: list its data pods (by label), pick any
-     reachable one. The controller does **not** read
-     `Valkey.status.primaryPodName`. Sentinel itself follows
-     `INFO replication` to discover the actual master.
+3. For each matched Valkey, read `Valkey.status.primaryEndpoint`
+   (populated by the Valkey controller's `observePrimary` step):
    - Read the per-Valkey `<name>-sentinel-auth` Secret for the
      `_sentinel` user credentials.
-   - Issue `SENTINEL MONITOR <valkey-name> <entry-ip> 6379 <quorum>` on
-     each sentinel pod that isn't already monitoring this master.
-   - Apply `SENTINEL SET <valkey-name> auth-user/auth-pass` from the
-     sentinel-auth Secret, plus every key/value in `spec.config`.
-4. For masters in `SENTINEL masters` whose name no longer corresponds
+   - Render a `sentinel monitor <name> <ip> <port> <quorum>` block,
+     plus `auth-user`, an `auth-pass` placeholder, and every
+     `spec.config` key, into `sentinel.conf` in the ConfigMap.
+4. Aggregate every matched Valkey's `_sentinel` password into a single
+   `<sentinel-name>-auth` Secret, keyed by Valkey name. Mounted at
+   `/sentinel-auth/` in each sentinel pod; the startup script
+   substitutes the password into the rendered config at boot.
+5. Stamp a content-hash annotation on the StatefulSet pod template so
+   the StatefulSet rolls (one pod at a time, respecting the PDB) when
+   the rendered template changes.
+6. For masters in `SENTINEL masters` whose name no longer corresponds
    to a Valkey matching the selector, issue `SENTINEL REMOVE` on each
-   pod **immediately** (no grace period; a relabel is intentional).
+   running pod **immediately** (no grace period; a relabel is
+   intentional). This is the only sentinel write the controller still
+   issues over the wire - the template alone can't subtract a master
+   from an already-running sentinel's view.
 5. Update `status.monitored` and `readyReplicas`.
 
 The sentinel reconciler reads no field of `Valkey.status`. The two

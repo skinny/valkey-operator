@@ -18,6 +18,9 @@ package controller
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
 	"sort"
 	"strconv"
 	"strings"
@@ -47,7 +50,24 @@ const (
 
 	sentinelDataVolumeName = "sentinel-data"
 	sentinelDataMountPath  = "/var/lib/sentinel"
+
+	sentinelAuthVolumeName = "sentinel-auth"
+	sentinelAuthMountPath  = "/sentinel-auth"
+
+	// sentinelConfigHashAnnotation is set on the StatefulSet pod
+	// template so a change to the rendered sentinel.conf template
+	// triggers a rolling restart of sentinel pods (one at a time,
+	// PDB-respecting). Without this the ConfigMap update would not
+	// reach running pods until they happen to restart.
+	sentinelConfigHashAnnotation = "valkey.io/sentinel-config-hash"
 )
+
+// sentinelAuthSecretName is the aggregated Secret holding one password
+// per matched Valkey, keyed by Valkey name. Mounted into every sentinel
+// pod and substituted into sentinel.conf by the startup script.
+func sentinelAuthSecretName(s *valkeyiov1alpha1.ValkeySentinel) string {
+	return sentinelResourceName(s) + "-auth"
+}
 
 func sentinelResourceName(s *valkeyiov1alpha1.ValkeySentinel) string {
 	return sentinelResourcePrefix + s.Name
@@ -97,15 +117,34 @@ func (r *ValkeySentinelReconciler) upsertSentinelService(ctx context.Context, s 
 	return err
 }
 
-// upsertSentinelConfigMap renders the runtime sentinel.conf template
-// (no `sentinel monitor` directives - added at runtime by the
-// controller) plus the startup script.
-func (r *ValkeySentinelReconciler) upsertSentinelConfigMap(ctx context.Context, s *valkeyiov1alpha1.ValkeySentinel) error {
+// monitoredValkey bundles everything the sentinel template needs about
+// one Valkey: the master endpoint observed by the Valkey controller,
+// the quorum to use, and the SENTINEL SET tuning to bake in.
+type monitoredValkey struct {
+	Name     string
+	IP       string
+	Port     int32
+	Quorum   int32
+	Username string
+	Config   map[string]string
+}
+
+// upsertSentinelConfigMap renders sentinel.conf with `sentinel monitor`
+// + tuning + auth-user baked in for every matched Valkey whose primary
+// endpoint the Valkey controller has observed. The auth password is
+// left as a `__SENTINEL_AUTH_PASS_<name>__` placeholder; the startup
+// script substitutes it from the per-Valkey password file mounted from
+// the aggregated sentinel-auth Secret.
+//
+// Baking the monitor + tuning into the template is what the hand-rolled
+// sentinel YAML does, and it avoids the burst of SENTINEL SET commands
+// that previously hit the timer during startup TILT.
+func (r *ValkeySentinelReconciler) upsertSentinelConfigMap(ctx context.Context, s *valkeyiov1alpha1.ValkeySentinel, monitors []monitoredValkey) (string, error) {
 	startup, err := scripts.ReadFile("scripts/" + sentinelStartupScriptKey)
 	if err != nil {
-		return err
+		return "", err
 	}
-	template := renderSentinelTemplate()
+	template := renderSentinelTemplate(monitors)
 	cm := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{
 		Name: sentinelResourceName(s), Namespace: s.Namespace,
 	}}
@@ -117,32 +156,70 @@ func (r *ValkeySentinelReconciler) upsertSentinelConfigMap(ctx context.Context, 
 		}
 		return controllerutil.SetControllerReference(s, cm, r.Scheme)
 	})
-	return err
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256([]byte(template))
+	return hex.EncodeToString(sum[:]), nil
 }
 
-// renderSentinelTemplate builds the template without any `sentinel
-// monitor` lines. Those are added at runtime via SENTINEL MONITOR.
-func renderSentinelTemplate() string {
-	cfg := map[string]string{
-		"port":                       strconv.Itoa(valkeyiov1alpha1.SentinelPort),
-		"dir":                        sentinelDataMountPath,
-		"sentinel resolve-hostnames": "yes",
-		"sentinel announce-ip":       "__POD_IP__",
-		"sentinel announce-port":     strconv.Itoa(valkeyiov1alpha1.SentinelPort),
+// renderSentinelTemplate produces the sentinel.conf the startup script
+// will materialize. Per-Valkey monitor + tuning blocks are deterministic
+// (sorted by name) so the hash used to trigger pod rolls is stable.
+func renderSentinelTemplate(monitors []monitoredValkey) string {
+	base := []string{
+		"port " + strconv.Itoa(valkeyiov1alpha1.SentinelPort),
+		"dir " + sentinelDataMountPath,
+		"sentinel resolve-hostnames yes",
+		"sentinel announce-ip __POD_IP__",
+		"sentinel announce-port " + strconv.Itoa(valkeyiov1alpha1.SentinelPort),
 	}
-	keys := make([]string, 0, len(cfg))
-	for k := range cfg {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
 	var b strings.Builder
-	for _, k := range keys {
-		b.WriteString(k)
-		b.WriteByte(' ')
-		b.WriteString(cfg[k])
+	for _, line := range base {
+		b.WriteString(line)
 		b.WriteByte('\n')
 	}
+
+	sortedMonitors := append([]monitoredValkey(nil), monitors...)
+	sort.Slice(sortedMonitors, func(i, j int) bool { return sortedMonitors[i].Name < sortedMonitors[j].Name })
+
+	for _, m := range sortedMonitors {
+		b.WriteByte('\n')
+		fmt.Fprintf(&b, "sentinel monitor %s %s %d %d\n", m.Name, m.IP, m.Port, m.Quorum)
+		fmt.Fprintf(&b, "sentinel auth-user %s %s\n", m.Name, m.Username)
+		fmt.Fprintf(&b, "sentinel auth-pass %s __SENTINEL_AUTH_PASS_%s__\n", m.Name, m.Name)
+		keys := make([]string, 0, len(m.Config))
+		for k := range m.Config {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			fmt.Fprintf(&b, "sentinel %s %s %s\n", k, m.Name, m.Config[k])
+		}
+	}
 	return b.String()
+}
+
+// upsertSentinelAuthSecret maintains one aggregated Secret per
+// ValkeySentinel that holds, keyed by Valkey name, the per-Valkey
+// sentinel password. Mounted at /sentinel-auth/ into every sentinel
+// pod so the startup script can substitute __SENTINEL_AUTH_PASS_<name>__
+// placeholders without ever exposing the password to the ConfigMap or
+// to pod env.
+func (r *ValkeySentinelReconciler) upsertSentinelAuthSecret(ctx context.Context, s *valkeyiov1alpha1.ValkeySentinel, passwords map[string]string) error {
+	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{
+		Name: sentinelAuthSecretName(s), Namespace: s.Namespace,
+	}}
+	_, err := controllerutil.CreateOrUpdate(ctx, r.Client, secret, func() error {
+		secret.Labels = sentinelLabels(s)
+		secret.Type = corev1.SecretTypeOpaque
+		secret.Data = map[string][]byte{}
+		for name, pw := range passwords {
+			secret.Data[name] = []byte(pw)
+		}
+		return controllerutil.SetControllerReference(s, secret, r.Scheme)
+	})
+	return err
 }
 
 // upsertSentinelPDB reconciles a PDB with maxUnavailable=1 unless disabled.
@@ -173,10 +250,13 @@ func (r *ValkeySentinelReconciler) upsertSentinelPDB(ctx context.Context, s *val
 }
 
 // upsertSentinelStatefulSet reconciles the StatefulSet that runs the
-// sentinel pods.
-func (r *ValkeySentinelReconciler) upsertSentinelStatefulSet(ctx context.Context, s *valkeyiov1alpha1.ValkeySentinel) (*appsv1.StatefulSet, error) {
+// sentinel pods. The configHash annotation triggers a rolling restart
+// (one pod at a time, respecting the PDB) when the rendered template
+// changes.
+func (r *ValkeySentinelReconciler) upsertSentinelStatefulSet(ctx context.Context, s *valkeyiov1alpha1.ValkeySentinel, configHash string) (*appsv1.StatefulSet, error) {
 	defaultMode := int32(0o755)
 	cmName := sentinelResourceName(s)
+	authName := sentinelAuthSecretName(s)
 
 	desired := &appsv1.StatefulSet{
 		ObjectMeta: metav1.ObjectMeta{
@@ -188,7 +268,10 @@ func (r *ValkeySentinelReconciler) upsertSentinelStatefulSet(ctx context.Context
 			ServiceName: sentinelResourceName(s),
 			Selector:    &metav1.LabelSelector{MatchLabels: sentinelSelectorLabels(s)},
 			Template: corev1.PodTemplateSpec{
-				ObjectMeta: metav1.ObjectMeta{Labels: sentinelLabels(s)},
+				ObjectMeta: metav1.ObjectMeta{
+					Labels:      sentinelLabels(s),
+					Annotations: map[string]string{sentinelConfigHashAnnotation: configHash},
+				},
 				Spec: corev1.PodSpec{
 					NodeSelector: s.Spec.NodeSelector,
 					Affinity:     s.Spec.Affinity,
@@ -222,6 +305,7 @@ func (r *ValkeySentinelReconciler) upsertSentinelStatefulSet(ctx context.Context
 						VolumeMounts: []corev1.VolumeMount{
 							{Name: "scripts", MountPath: "/scripts"},
 							{Name: "sentinel-conf", MountPath: "/config", ReadOnly: true},
+							{Name: sentinelAuthVolumeName, MountPath: sentinelAuthMountPath, ReadOnly: true},
 							{Name: sentinelDataVolumeName, MountPath: sentinelDataMountPath},
 						},
 					}},
@@ -237,6 +321,9 @@ func (r *ValkeySentinelReconciler) upsertSentinelStatefulSet(ctx context.Context
 								LocalObjectReference: corev1.LocalObjectReference{Name: cmName},
 							},
 						}},
+						{Name: sentinelAuthVolumeName, VolumeSource: corev1.VolumeSource{
+							Secret: &corev1.SecretVolumeSource{SecretName: authName},
+						}},
 						{Name: sentinelDataVolumeName, VolumeSource: corev1.VolumeSource{
 							// Memory-backed (tmpfs). sentinel.conf is rewritten +
 							// fsynced on every gossip update, vote, and state
@@ -246,10 +333,9 @@ func (r *ValkeySentinelReconciler) upsertSentinelStatefulSet(ctx context.Context
 							// SENTINEL_TILT_TRIGGER (2s) and wedging promotion.
 							// Backing the volume with tmpfs makes fsync a no-op.
 							// State loss on pod restart is fine: the startup
-							// script re-renders the base config from the
-							// ConfigMap template, the operator re-issues
-							// MONITOR+SET on the next reconcile, and gossip
-							// repopulates peers.
+							// script re-renders the full config from the template
+							// (master IP, auth, tuning) and gossip repopulates
+							// known peers.
 							EmptyDir: &corev1.EmptyDirVolumeSource{Medium: corev1.StorageMediumMemory},
 						}},
 					},

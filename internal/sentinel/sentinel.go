@@ -98,33 +98,6 @@ func (c *Client) GetMasterAddr(ctx context.Context, masterName string) (MasterAd
 	return MasterAddr{IP: pairs[0], Port: port}, nil
 }
 
-// Monitor issues `SENTINEL MONITOR <name> <ip> <port> <quorum>`.
-func (c *Client) Monitor(ctx context.Context, masterName, ip string, port, quorum int) error {
-	cmd := c.client.B().Arbitrary("SENTINEL", "MONITOR", masterName, ip, strconv.Itoa(port), strconv.Itoa(quorum)).Build()
-	if err := c.client.Do(ctx, cmd).Error(); err != nil {
-		return fmt.Errorf("SENTINEL MONITOR %s %s:%d quorum=%d on %s: %w", masterName, ip, port, quorum, c.addr, err)
-	}
-	return nil
-}
-
-// Set issues `SENTINEL SET <name> <option> <value>`.
-func (c *Client) Set(ctx context.Context, masterName, option, value string) error {
-	cmd := c.client.B().Arbitrary("SENTINEL", "SET", masterName, option, value).Build()
-	if err := c.client.Do(ctx, cmd).Error(); err != nil {
-		return fmt.Errorf("SENTINEL SET %s %s=%s on %s: %w", masterName, option, value, c.addr, err)
-	}
-	return nil
-}
-
-// Failover issues `SENTINEL FAILOVER <name>`.
-func (c *Client) Failover(ctx context.Context, masterName string) error {
-	cmd := c.client.B().Arbitrary("SENTINEL", "FAILOVER", masterName).Build()
-	if err := c.client.Do(ctx, cmd).Error(); err != nil {
-		return fmt.Errorf("SENTINEL FAILOVER %s on %s: %w", masterName, c.addr, err)
-	}
-	return nil
-}
-
 // Remove issues `SENTINEL REMOVE <name>`.
 func (c *Client) Remove(ctx context.Context, masterName string) error {
 	cmd := c.client.B().Arbitrary("SENTINEL", "REMOVE", masterName).Build()

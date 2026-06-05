@@ -19,9 +19,7 @@ package controller
 import (
 	"context"
 	"fmt"
-	"strings"
 
-	vclient "github.com/valkey-io/valkey-go"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	klabels "k8s.io/apimachinery/pkg/labels"
@@ -32,17 +30,73 @@ import (
 	"valkey.io/valkey-operator/internal/sentinel"
 )
 
-// reconcileMonitoring is the core of the ValkeySentinel reconciler:
-// for every Valkey matching spec.valkeySelector, point SENTINEL MONITOR
-// at any reachable data pod and apply spec.config + auth via SENTINEL
-// SET. For masters that no longer match the selector, issue SENTINEL
-// REMOVE.
+// collectMonitorConfigs builds the per-Valkey monitor blocks that go
+// into the sentinel.conf template and the aggregated auth Secret.
 //
-// Returns the sorted list of master names currently monitored.
-func (r *ValkeySentinelReconciler) reconcileMonitoring(ctx context.Context, s *valkeyiov1alpha1.ValkeySentinel) ([]string, error) {
+// A Valkey is included only when:
+//   - it matches spec.valkeySelector,
+//   - it is replicated (spec.replicas > 0),
+//   - its sentinel-auth Secret exists,
+//   - the Valkey controller has populated status.primaryEndpoint.
+//
+// Excluding a Valkey here means the sentinels boot without a `sentinel
+// monitor` line for it; when the Valkey controller observes a primary,
+// status.primaryEndpoint is set, the watch fires this reconciler, and
+// the template + Secret are re-rendered. The hash annotation on the
+// StatefulSet pod template then triggers a controlled rolling restart
+// so the new config reaches the sentinel pods.
+func (r *ValkeySentinelReconciler) collectMonitorConfigs(ctx context.Context, s *valkeyiov1alpha1.ValkeySentinel) ([]monitoredValkey, map[string]string, error) {
+	matched, err := r.matchedValkeys(ctx, s)
+	if err != nil {
+		return nil, nil, err
+	}
+	log := logf.FromContext(ctx)
+	monitors := make([]monitoredValkey, 0, len(matched))
+	passwords := make(map[string]string, len(matched))
+	quorum := s.Spec.EffectiveQuorum()
+	for _, v := range matched {
+		if v.Status.PrimaryEndpoint == nil || v.Status.PrimaryEndpoint.IP == "" {
+			log.V(1).Info("skipping Valkey without observed primary; will reconcile when status.primaryEndpoint is set", "valkey", v.Name)
+			continue
+		}
+		user, pass, err := r.readSentinelAuth(ctx, v)
+		if err != nil {
+			log.V(1).Info("sentinel-auth secret unavailable; skipping", "valkey", v.Name, "err", err)
+			continue
+		}
+		monitors = append(monitors, monitoredValkey{
+			Name:     v.Name,
+			IP:       v.Status.PrimaryEndpoint.IP,
+			Port:     v.Status.PrimaryEndpoint.Port,
+			Quorum:   quorum,
+			Username: user,
+			Config:   s.Spec.Config,
+		})
+		passwords[v.Name] = pass
+	}
+	return monitors, passwords, nil
+}
+
+// reconcileMonitoring drives the SENTINEL REMOVE pass for masters the
+// sentinels still know about but the selector no longer matches.
+//
+// MONITOR + SET no longer happen over the wire in steady state: the
+// ConfigMap template carries the full per-Valkey block (monitor + auth
+// + tuning) and every sentinel pod reads it on boot. This avoids the
+// burst of CONFIG REWRITE writes during startup that previously trip
+// SENTINEL_TILT_TRIGGER.
+//
+// Returns the sorted list of Valkeys that are currently configured for
+// monitoring (i.e. baked into the template) so callers can surface it
+// on .status.
+func (r *ValkeySentinelReconciler) reconcileMonitoring(ctx context.Context, s *valkeyiov1alpha1.ValkeySentinel, monitors []monitoredValkey) ([]string, error) {
 	log := logf.FromContext(ctx)
 
-	// 1. Open one client per reachable sentinel pod.
+	matchedNames := map[string]bool{}
+	for _, m := range monitors {
+		matchedNames[m.Name] = true
+	}
+
 	sentinelClients, err := r.dialSentinelPods(ctx, s)
 	if err != nil {
 		return nil, err
@@ -53,94 +107,34 @@ func (r *ValkeySentinelReconciler) reconcileMonitoring(ctx context.Context, s *v
 		}
 	}()
 	if len(sentinelClients) == 0 {
-		return nil, fmt.Errorf("no sentinel pods reachable")
+		// Sentinels not yet reachable; the template is already
+		// up-to-date so the next reconcile will pick up REMOVE work
+		// when pods are ready.
+		out := make([]string, 0, len(monitors))
+		for _, m := range monitors {
+			out = append(out, m.Name)
+		}
+		return out, nil
 	}
 
-	// 2. Find matched Valkeys.
-	matched, err := r.matchedValkeys(ctx, s)
-	if err != nil {
-		return nil, err
-	}
-	matchedNames := map[string]bool{}
-	for _, v := range matched {
-		matchedNames[v.Name] = true
-	}
-
-	// 3. Discover what each sentinel already monitors. Tracked
-	//    per-sentinel because sentinels do NOT gossip masters between
-	//    each other (only peer sentinels gossip via __sentinel__:hello).
-	//    Every sentinel must be told about every master independently
-	//    via SENTINEL MONITOR.
-	monitoredBy := map[string]map[string]bool{} // sentinelAddr -> masterName -> bool
-	allMonitored := map[string]bool{}           // union, for the REMOVE cleanup pass
+	// Sweep stale masters: anything a sentinel still knows about that
+	// is not in the current matched set must be REMOVEd, because the
+	// template-only model can't subtract a master from a running
+	// sentinel's view (the pod has to either restart or be told).
+	stale := map[string]bool{}
 	for _, c := range sentinelClients {
 		names, err := c.Masters(ctx)
 		if err != nil {
 			log.V(1).Info("SENTINEL MASTERS failed", "addr", c.Addr(), "err", err)
 			continue
 		}
-		set := make(map[string]bool, len(names))
 		for _, n := range names {
-			set[n] = true
-			allMonitored[n] = true
+			if !matchedNames[n] {
+				stale[n] = true
+			}
 		}
-		monitoredBy[c.Addr()] = set
 	}
-
-	// 4. For each matched Valkey, MONITOR + SET on every sentinel that
-	//    doesn't already know about this master.
-	quorum := int(s.Spec.EffectiveQuorum())
-	monitored := []string{}
-	for _, v := range matched {
-		authUser, authPass, err := r.readSentinelAuth(ctx, v)
-		if err != nil {
-			log.V(1).Info("sentinel-auth secret unavailable; skipping", "valkey", v.Name, "err", err)
-			continue
-		}
-		entryIP, err := r.pickMasterEntryIP(ctx, v, authUser, authPass)
-		if err != nil {
-			log.V(1).Info("no reachable data pod yet; skipping", "valkey", v.Name, "err", err)
-			continue
-		}
-		for _, c := range sentinelClients {
-			// Per the standard Sentinel model, MONITOR is a one-shot
-			// registration. Once a sentinel knows about a master, the
-			// operator does not override its view - sentinel manages
-			// topology changes (failover, replica discovery, etc.)
-			// itself via INFO + gossip. The operator only sets the
-			// initial IP and the tuning knobs.
-			//
-			// SET is also one-shot. Every SENTINEL SET triggers a
-			// CONFIG REWRITE + fsync on the sentinel, and chatter
-			// from the operator during a failover can starve the
-			// sentinel timer enough to trip TILT mode. Treat the
-			// initial MONITOR as the only time we push auth + config.
-			if monitoredBy[c.Addr()][v.Name] {
-				continue
-			}
-			if err := c.Monitor(ctx, v.Name, entryIP, DefaultPort, quorum); err != nil {
-				log.V(1).Info("SENTINEL MONITOR failed", "addr", c.Addr(), "valkey", v.Name, "err", err)
-				continue
-			}
-			if err := c.Set(ctx, v.Name, "auth-user", authUser); err != nil {
-				log.V(1).Info("SENTINEL SET auth-user failed", "addr", c.Addr(), "valkey", v.Name, "err", err)
-			}
-			if err := c.Set(ctx, v.Name, "auth-pass", authPass); err != nil {
-				log.V(1).Info("SENTINEL SET auth-pass failed", "addr", c.Addr(), "valkey", v.Name, "err", err)
-			}
-			for k, val := range s.Spec.Config {
-				_ = c.Set(ctx, v.Name, k, val)
-			}
-		}
-		monitored = append(monitored, v.Name)
-	}
-
-	// 5. For masters the sentinels know about that no longer match,
-	//    REMOVE immediately (no grace period per design).
-	for name := range allMonitored {
-		if matchedNames[name] {
-			continue
-		}
+	for name := range stale {
 		for _, c := range sentinelClients {
 			if err := c.Remove(ctx, name); err != nil {
 				log.V(1).Info("SENTINEL REMOVE failed", "addr", c.Addr(), "master", name, "err", err)
@@ -150,7 +144,11 @@ func (r *ValkeySentinelReconciler) reconcileMonitoring(ctx context.Context, s *v
 			"Stopped monitoring %q (no longer matched by selector)", name)
 	}
 
-	return monitored, nil
+	out := make([]string, 0, len(monitors))
+	for _, m := range monitors {
+		out = append(out, m.Name)
+	}
+	return out, nil
 }
 
 // dialSentinelPods opens a sentinel client to each pod labelled for
@@ -203,76 +201,6 @@ func (r *ValkeySentinelReconciler) matchedValkeys(ctx context.Context, s *valkey
 		}
 	}
 	return out, nil
-}
-
-// pickMasterEntryIP picks the IP of the data pod currently reporting
-// role:master, so SENTINEL MONITOR is given the actual primary. In
-// practice Sentinel does NOT gracefully follow master_host when handed
-// a replica IP - it marks the configured master s_down and gets stuck.
-// We probe each pod's role directly via INFO replication using the
-// _sentinel credentials (no read of Valkey.status; this is independent
-// observation, not cross-CR state reliance).
-//
-// Falls back to any reachable pod IP if none reports role:master
-// (e.g. transient state during initial bring-up). Sentinel will mark
-// the master s_down briefly until a primary settles, which is
-// preferable to refusing to issue MONITOR at all.
-func (r *ValkeySentinelReconciler) pickMasterEntryIP(ctx context.Context, v *valkeyiov1alpha1.Valkey, authUser, authPass string) (string, error) {
-	pods := &corev1.PodList{}
-	if err := r.List(ctx, pods,
-		client.InNamespace(v.Namespace),
-		client.MatchingLabels{LabelValkey: v.Name},
-	); err != nil {
-		return "", err
-	}
-	var fallback string
-	for i := range pods.Items {
-		p := &pods.Items[i]
-		if p.Status.PodIP == "" {
-			continue
-		}
-		if fallback == "" {
-			fallback = p.Status.PodIP
-		}
-		role, err := dataPodRole(ctx, p.Status.PodIP, authUser, authPass)
-		if err != nil {
-			continue
-		}
-		if role == "master" {
-			return p.Status.PodIP, nil
-		}
-	}
-	if fallback != "" {
-		return fallback, nil
-	}
-	return "", fmt.Errorf("no data pod has a PodIP yet")
-}
-
-// dataPodRole returns the value of the `role` line in INFO replication
-// (either "master" or "slave"). Authenticates with the _sentinel user
-// since that's the only credential the sentinel controller holds.
-func dataPodRole(ctx context.Context, ip, user, password string) (string, error) {
-	c, err := vclient.NewClient(vclient.ClientOption{
-		InitAddress:       []string{fmt.Sprintf("%s:%d", ip, DefaultPort)},
-		ForceSingleClient: true,
-		Username:          user,
-		Password:          password,
-	})
-	if err != nil {
-		return "", err
-	}
-	defer c.Close()
-	raw, err := c.Do(ctx, c.B().Info().Section("replication").Build()).ToString()
-	if err != nil {
-		return "", err
-	}
-	for line := range strings.SplitSeq(raw, "\n") {
-		line = strings.TrimSpace(line)
-		if k, val, ok := strings.Cut(line, ":"); ok && k == "role" {
-			return strings.TrimSpace(val), nil
-		}
-	}
-	return "", nil
 }
 
 // readSentinelAuth reads the per-Valkey <name>-sentinel-auth Secret.

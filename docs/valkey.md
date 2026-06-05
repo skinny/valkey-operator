@@ -66,8 +66,8 @@ discovered from the other side:
 1. You create a `Valkey` with some labels.
 2. You create a `ValkeySentinel` with `spec.valkeySelector` matching
    those labels.
-3. The sentinel controller starts monitoring this Valkey (issues
-   `SENTINEL MONITOR`).
+3. The sentinel controller renders this Valkey's primary endpoint
+   into its sentinel.conf template and rolls the sentinel pods.
 4. The Valkey controller observes the selecting sentinel and populates
    `status.monitoredBy` and the `Monitored=True` condition.
 
@@ -122,5 +122,6 @@ graph TD
 
     S[ValkeySentinel CR]
     S -.->|spec.valkeySelector matches V.labels| V
-    S -.->|SENTINEL MONITOR| P
+    S -.->|reads V.status.primaryEndpoint| V
+    S -.->|sentinel monitor (in sentinel.conf)| P
 ```

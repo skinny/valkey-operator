@@ -85,7 +85,12 @@ var _ = Describe("ValkeySentinel controller", func() {
 		Expect(cm.Data).To(HaveKey(sentinelStartupScriptKey))
 		Expect(cm.Data).To(HaveKey(sentinelConfigTemplateKey))
 		Expect(cm.Data[sentinelConfigTemplateKey]).To(ContainSubstring("__POD_IP__"))
+		// No matched Valkeys with primary endpoint -> no monitor blocks
 		Expect(cm.Data[sentinelConfigTemplateKey]).NotTo(ContainSubstring("sentinel monitor "))
+
+		// Aggregated auth Secret is always present (empty when no matches).
+		authSecret := &corev1.Secret{}
+		Expect(k8sClient.Get(ctx, client.ObjectKey{Name: "valkey-sentinel-" + name + "-auth", Namespace: "default"}, authSecret)).To(Succeed())
 
 		pdb := &policyv1.PodDisruptionBudget{}
 		Expect(k8sClient.Get(ctx, client.ObjectKey{Name: "valkey-sentinel-" + name, Namespace: "default"}, pdb)).To(Succeed())
@@ -96,6 +101,44 @@ var _ = Describe("ValkeySentinel controller", func() {
 		Expect(*ss.Spec.Replicas).To(Equal(int32(3)))
 		Expect(ss.Spec.Template.Spec.Containers).To(HaveLen(1))
 		Expect(ss.Spec.Template.Spec.Containers[0].Ports[0].ContainerPort).To(Equal(int32(valkeyiov1alpha1.SentinelPort)))
+		// Pod template carries the config-hash annotation that drives rolling restarts.
+		Expect(ss.Spec.Template.Annotations).To(HaveKey(sentinelConfigHashAnnotation))
+		// Auth secret is mounted read-only.
+		var foundAuth bool
+		for _, vol := range ss.Spec.Template.Spec.Volumes {
+			if vol.Name == sentinelAuthVolumeName {
+				Expect(vol.Secret).NotTo(BeNil())
+				Expect(vol.Secret.SecretName).To(Equal("valkey-sentinel-" + name + "-auth"))
+				foundAuth = true
+			}
+		}
+		Expect(foundAuth).To(BeTrue())
+	})
+})
+
+var _ = Describe("renderSentinelTemplate", func() {
+	It("produces only the base block when no Valkeys are monitored", func() {
+		out := renderSentinelTemplate(nil)
+		Expect(out).To(ContainSubstring("port 26379"))
+		Expect(out).To(ContainSubstring("__POD_IP__"))
+		Expect(out).NotTo(ContainSubstring("sentinel monitor "))
+		Expect(out).NotTo(ContainSubstring("__SENTINEL_AUTH_PASS_"))
+	})
+	It("bakes monitor + auth-user + tuning per Valkey with sorted, stable output", func() {
+		monitors := []monitoredValkey{
+			{Name: "b-cache", IP: "10.0.0.2", Port: 6379, Quorum: 2, Username: "_sentinel",
+				Config: map[string]string{"down-after-milliseconds": "30000", "failover-timeout": "180000"}},
+			{Name: "a-cache", IP: "10.0.0.1", Port: 6379, Quorum: 3, Username: "_sentinel"},
+		}
+		out := renderSentinelTemplate(monitors)
+		// Sorted alphabetically so the hash is stable across input order.
+		Expect(out).To(MatchRegexp(`(?s)sentinel monitor a-cache 10\.0\.0\.1 6379 3.*sentinel monitor b-cache 10\.0\.0\.2 6379 2`))
+		Expect(out).To(ContainSubstring("sentinel auth-user a-cache _sentinel"))
+		Expect(out).To(ContainSubstring("sentinel auth-pass a-cache __SENTINEL_AUTH_PASS_a-cache__"))
+		Expect(out).To(ContainSubstring("sentinel down-after-milliseconds b-cache 30000"))
+		Expect(out).To(ContainSubstring("sentinel failover-timeout b-cache 180000"))
+		// Re-rendering with the same input is byte-stable.
+		Expect(renderSentinelTemplate(monitors)).To(Equal(out))
 	})
 })
 
