@@ -66,23 +66,29 @@ func (r *ValkeySentinelReconciler) reconcileMonitoring(ctx context.Context, s *v
 		matchedNames[v.Name] = true
 	}
 
-	// 3. Discover what each sentinel already monitors. Union across all
-	//    reachable pods.
-	currentlyMonitored := map[string]bool{}
+	// 3. Discover what each sentinel already monitors. Tracked
+	//    per-sentinel because sentinels do NOT gossip masters between
+	//    each other (only peer sentinels gossip via __sentinel__:hello).
+	//    Every sentinel must be told about every master independently
+	//    via SENTINEL MONITOR.
+	monitoredBy := map[string]map[string]bool{} // sentinelAddr -> masterName -> bool
+	allMonitored := map[string]bool{}           // union, for the REMOVE cleanup pass
 	for _, c := range sentinelClients {
 		names, err := c.Masters(ctx)
 		if err != nil {
 			log.V(1).Info("SENTINEL MASTERS failed", "addr", c.Addr(), "err", err)
 			continue
 		}
+		set := make(map[string]bool, len(names))
 		for _, n := range names {
-			currentlyMonitored[n] = true
+			set[n] = true
+			allMonitored[n] = true
 		}
+		monitoredBy[c.Addr()] = set
 	}
 
 	// 4. For each matched Valkey, MONITOR + SET on every sentinel that
-	//    doesn't already know about this master (or always, to ensure
-	//    SET values catch up).
+	//    doesn't already know about this master.
 	quorum := int(s.Spec.EffectiveQuorum())
 	monitored := []string{}
 	for _, v := range matched {
@@ -109,7 +115,7 @@ func (r *ValkeySentinelReconciler) reconcileMonitoring(ctx context.Context, s *v
 			// from the operator during a failover can starve the
 			// sentinel timer enough to trip TILT mode. Treat the
 			// initial MONITOR as the only time we push auth + config.
-			if currentlyMonitored[v.Name] {
+			if monitoredBy[c.Addr()][v.Name] {
 				continue
 			}
 			if err := c.Monitor(ctx, v.Name, entryIP, DefaultPort, quorum); err != nil {
@@ -131,7 +137,7 @@ func (r *ValkeySentinelReconciler) reconcileMonitoring(ctx context.Context, s *v
 
 	// 5. For masters the sentinels know about that no longer match,
 	//    REMOVE immediately (no grace period per design).
-	for name := range currentlyMonitored {
+	for name := range allMonitored {
 		if matchedNames[name] {
 			continue
 		}
