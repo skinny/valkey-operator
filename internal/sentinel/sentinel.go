@@ -15,37 +15,19 @@ limitations under the License.
 */
 
 // Package sentinel wraps the SENTINEL command surface needed by the
-// Valkey and ValkeySentinel controllers.
+// ValkeySentinel controller.
 package sentinel
 
 import (
 	"context"
 	"crypto/tls"
-	"errors"
 	"fmt"
-	"strconv"
-	"strings"
 
 	vclient "github.com/valkey-io/valkey-go"
 )
 
 // Port is the canonical Sentinel TCP port.
 const Port = 26379
-
-// ErrNoMaster is returned when a sentinel does not (yet) know about the
-// requested master name.
-var ErrNoMaster = errors.New("sentinel: no such master")
-
-// MasterAddr is the address Sentinel reports for a monitored master.
-type MasterAddr struct {
-	IP   string
-	Port int
-}
-
-func (a MasterAddr) Empty() bool { return a.IP == "" }
-func (a MasterAddr) String() string {
-	return fmt.Sprintf("%s:%d", a.IP, a.Port)
-}
 
 // Client is a thin SENTINEL-command wrapper over the valkey-go client.
 type Client struct {
@@ -74,28 +56,6 @@ func (c *Client) Close() {
 	if c.client != nil {
 		c.client.Close()
 	}
-}
-
-// GetMasterAddr asks the sentinel for the current master address for
-// the named master. Returns ErrNoMaster when the sentinel does not yet
-// know about this master.
-func (c *Client) GetMasterAddr(ctx context.Context, masterName string) (MasterAddr, error) {
-	cmd := c.client.B().Arbitrary("SENTINEL", "GET-MASTER-ADDR-BY-NAME", masterName).Build()
-	pairs, err := c.client.Do(ctx, cmd).AsStrSlice()
-	if err != nil {
-		if isNoMasterErr(err) {
-			return MasterAddr{}, ErrNoMaster
-		}
-		return MasterAddr{}, fmt.Errorf("SENTINEL GET-MASTER-ADDR-BY-NAME %s on %s: %w", masterName, c.addr, err)
-	}
-	if len(pairs) < 2 {
-		return MasterAddr{}, nil
-	}
-	port, err := strconv.Atoi(pairs[1])
-	if err != nil {
-		return MasterAddr{}, fmt.Errorf("parse port %q from sentinel %s: %w", pairs[1], c.addr, err)
-	}
-	return MasterAddr{IP: pairs[0], Port: port}, nil
 }
 
 // Remove issues `SENTINEL REMOVE <name>`.
@@ -128,18 +88,4 @@ func (c *Client) Masters(ctx context.Context) ([]string, error) {
 		}
 	}
 	return out, nil
-}
-
-// Ping is a liveness check.
-func (c *Client) Ping(ctx context.Context) error {
-	return c.client.Do(ctx, c.client.B().Ping().Build()).Error()
-}
-
-func isNoMasterErr(err error) bool {
-	if err == nil {
-		return false
-	}
-	msg := strings.ToLower(err.Error())
-	return strings.Contains(msg, "no such master") ||
-		strings.Contains(msg, "no master with that name")
 }

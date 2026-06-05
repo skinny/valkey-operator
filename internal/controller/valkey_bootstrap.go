@@ -144,7 +144,7 @@ func (r *ValkeyReconciler) replicationCollapsed(ctx context.Context, valkey *val
 		return role, connectedSlaves, true
 	}
 	role, conn, ok := check(primary.Status.PodIP)
-	if !ok || role != "master" || conn != 0 {
+	if !ok || role != RoleMaster || conn != 0 {
 		return false, nil
 	}
 	for _, rep := range replicas {
@@ -152,7 +152,7 @@ func (r *ValkeyReconciler) replicationCollapsed(ctx context.Context, valkey *val
 		if !ok {
 			return false, nil
 		}
-		if role != "master" {
+		if role != RoleMaster {
 			return false, nil
 		}
 	}

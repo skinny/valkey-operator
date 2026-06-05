@@ -203,10 +203,11 @@ func (r *ValkeySentinelReconciler) matchedValkeys(ctx context.Context, s *valkey
 	return out, nil
 }
 
-// readSentinelAuth reads the per-Valkey <name>-sentinel-auth Secret.
+// readSentinelAuth reads the per-Valkey sentinel-auth Secret that the
+// Valkey controller projects (see projectSentinelAuthSecret).
 func (r *ValkeySentinelReconciler) readSentinelAuth(ctx context.Context, v *valkeyiov1alpha1.Valkey) (string, string, error) {
 	secret := &corev1.Secret{}
-	err := r.Get(ctx, client.ObjectKey{Name: v.Name + "-sentinel-auth", Namespace: v.Namespace}, secret)
+	err := r.Get(ctx, client.ObjectKey{Name: valkeySentinelAuthSecretName(v), Namespace: v.Namespace}, secret)
 	if err != nil {
 		return "", "", err
 	}

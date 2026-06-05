@@ -88,9 +88,9 @@ const (
 	// failover promotion - can succeed.
 	writableConfigVolumeName = "valkey-conf-writable"
 	writableConfigPath       = "/etc/valkey"
-	tlsSecretKeyCA   = "ca.crt"
-	tlsSecretKeyCert = "tls.crt"
-	tlsSecretKeyKey  = "tls.key"
+	tlsSecretKeyCA           = "ca.crt"
+	tlsSecretKeyCert         = "tls.crt"
+	tlsSecretKeyKey          = "tls.key"
 )
 
 // Role label values.
