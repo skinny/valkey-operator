@@ -29,6 +29,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
@@ -96,6 +97,17 @@ func sentinelImageFor(s *valkeyiov1alpha1.ValkeySentinel) string {
 		return s.Spec.Image
 	}
 	return DefaultImage
+}
+
+// sentinelDataEmptyDir is the tmpfs spec for the sentinel data volume.
+// Split out so the size limit lives next to the explanation of why
+// tmpfs is needed at all.
+func sentinelDataEmptyDir() *corev1.EmptyDirVolumeSource {
+	size := resource.MustParse("16Mi")
+	return &corev1.EmptyDirVolumeSource{
+		Medium:    corev1.StorageMediumMemory,
+		SizeLimit: &size,
+	}
 }
 
 // upsertSentinelService creates/updates the headless sentinel Service.
@@ -280,7 +292,7 @@ func (r *ValkeySentinelReconciler) upsertSentinelStatefulSet(ctx context.Context
 						Name:      "sentinel",
 						Image:     sentinelImageFor(s),
 						Resources: s.Spec.Resources,
-						Command:   []string{"/bin/bash", "-c", "/scripts/" + sentinelStartupScriptKey},
+						Command:   []string{"/scripts/" + sentinelStartupScriptKey},
 						Env: []corev1.EnvVar{{
 							Name: "POD_IP",
 							ValueFrom: &corev1.EnvVarSource{
@@ -335,8 +347,9 @@ func (r *ValkeySentinelReconciler) upsertSentinelStatefulSet(ctx context.Context
 							// State loss on pod restart is fine: the startup
 							// script re-renders the full config from the template
 							// (master IP, auth, tuning) and gossip repopulates
-							// known peers.
-							EmptyDir: &corev1.EmptyDirVolumeSource{Medium: corev1.StorageMediumMemory},
+							// known peers. The size limit caps the tmpfs against
+							// the pod's memory budget; sentinel.conf is small.
+							EmptyDir: sentinelDataEmptyDir(),
 						}},
 					},
 				},

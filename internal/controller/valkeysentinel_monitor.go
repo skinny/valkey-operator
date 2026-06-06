@@ -88,8 +88,9 @@ func (r *ValkeySentinelReconciler) collectMonitorConfigs(ctx context.Context, s 
 //
 // Returns the sorted list of Valkeys that are currently configured for
 // monitoring (i.e. baked into the template) so callers can surface it
-// on .status.
-func (r *ValkeySentinelReconciler) reconcileMonitoring(ctx context.Context, s *valkeyiov1alpha1.ValkeySentinel, monitors []monitoredValkey) ([]string, error) {
+// on .status. The bool is true when stale-sweep work could not be
+// attempted (no sentinel pods reachable) so the caller knows to requeue.
+func (r *ValkeySentinelReconciler) reconcileMonitoring(ctx context.Context, s *valkeyiov1alpha1.ValkeySentinel, monitors []monitoredValkey) ([]string, bool, error) {
 	log := logf.FromContext(ctx)
 
 	matchedNames := map[string]bool{}
@@ -99,7 +100,7 @@ func (r *ValkeySentinelReconciler) reconcileMonitoring(ctx context.Context, s *v
 
 	sentinelClients, err := r.dialSentinelPods(ctx, s)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	defer func() {
 		for _, c := range sentinelClients {
@@ -109,12 +110,14 @@ func (r *ValkeySentinelReconciler) reconcileMonitoring(ctx context.Context, s *v
 	if len(sentinelClients) == 0 {
 		// Sentinels not yet reachable; the template is already
 		// up-to-date so the next reconcile will pick up REMOVE work
-		// when pods are ready.
+		// when pods are ready. Signal the caller to requeue so a
+		// transient loss of all pods doesn't strand a pending REMOVE
+		// until a watch fires.
 		out := make([]string, 0, len(monitors))
 		for _, m := range monitors {
 			out = append(out, m.Name)
 		}
-		return out, nil
+		return out, true, nil
 	}
 
 	// Sweep stale masters: anything a sentinel still knows about that
@@ -148,7 +151,7 @@ func (r *ValkeySentinelReconciler) reconcileMonitoring(ctx context.Context, s *v
 	for _, m := range monitors {
 		out = append(out, m.Name)
 	}
-	return out, nil
+	return out, false, nil
 }
 
 // dialSentinelPods opens a sentinel client to each pod labelled for

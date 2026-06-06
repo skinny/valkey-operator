@@ -24,6 +24,8 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/events"
@@ -112,6 +114,32 @@ var _ = Describe("Valkey controller", func() {
 			Expect(nodes.Items).To(HaveLen(3)) // 1 primary + 2 replicas
 		})
 
+		It("sets MultiplyMonitored=True when more than one ValkeySentinel selects it", func() {
+			for _, n := range []string{"sent-a", "sent-b"} {
+				s := &valkeyiov1alpha1.ValkeySentinel{
+					ObjectMeta: metav1.ObjectMeta{Name: n, Namespace: "default"},
+					Spec: valkeyiov1alpha1.ValkeySentinelSpec{
+						Replicas: 3,
+						ValkeySelector: metav1.LabelSelector{
+							MatchLabels: map[string]string{"tier": "caching"},
+						},
+					},
+				}
+				Expect(k8sClient.Create(ctx, s)).To(Succeed())
+				DeferCleanup(func() { _ = k8sClient.Delete(ctx, s) })
+			}
+			r := newReconciler()
+			Eventually(func(g Gomega) {
+				_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: nn})
+				g.Expect(err).NotTo(HaveOccurred())
+				updated := &valkeyiov1alpha1.Valkey{}
+				g.Expect(k8sClient.Get(ctx, nn, updated)).To(Succeed())
+				g.Expect(meta.IsStatusConditionTrue(updated.Status.Conditions,
+					valkeyiov1alpha1.ConditionMultiplyMonitored)).To(BeTrue())
+				g.Expect(updated.Status.MonitoredBy).To(ConsistOf("sent-a", "sent-b"))
+			}).Should(Succeed())
+		})
+
 		It("populates status.monitoredBy when a ValkeySentinel selects it", func() {
 			sentinel := &valkeyiov1alpha1.ValkeySentinel{
 				ObjectMeta: metav1.ObjectMeta{Name: "test-monitor", Namespace: "default"},
@@ -136,6 +164,44 @@ var _ = Describe("Valkey controller", func() {
 				g.Expect(k8sClient.Get(ctx, nn, updated)).To(Succeed())
 				g.Expect(updated.Status.MonitoredBy).To(ContainElement("test-monitor"))
 			}).Should(Succeed())
+		})
+	})
+
+	Context("persistence immutability", func() {
+		const name = "test-persist"
+		nn := types.NamespacedName{Name: name, Namespace: "default"}
+
+		AfterEach(func() {
+			v := &valkeyiov1alpha1.Valkey{}
+			if err := k8sClient.Get(ctx, nn, v); err == nil {
+				_ = k8sClient.Delete(ctx, v)
+			}
+		})
+
+		It("permits adding persistence after creation, rejects removal, and rejects shrink", func() {
+			v := &valkeyiov1alpha1.Valkey{
+				ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"},
+				Spec:       valkeyiov1alpha1.ValkeySpec{Replicas: 0},
+			}
+			Expect(k8sClient.Create(ctx, v)).To(Succeed())
+
+			// Add persistence after creation: must be allowed (rebuts the
+			// originally-overstrict rule that forbade additions).
+			Expect(k8sClient.Get(ctx, nn, v)).To(Succeed())
+			v.Spec.Persistence = &valkeyiov1alpha1.PersistenceSpec{
+				Size: resource.MustParse("1Gi"),
+			}
+			Expect(k8sClient.Update(ctx, v)).To(Succeed())
+
+			// Shrink: must be rejected.
+			Expect(k8sClient.Get(ctx, nn, v)).To(Succeed())
+			v.Spec.Persistence.Size = resource.MustParse("500Mi")
+			Expect(k8sClient.Update(ctx, v)).To(MatchError(ContainSubstring("expanded")))
+
+			// Remove: must be rejected.
+			Expect(k8sClient.Get(ctx, nn, v)).To(Succeed())
+			v.Spec.Persistence = nil
+			Expect(k8sClient.Update(ctx, v)).To(MatchError(ContainSubstring("removed")))
 		})
 	})
 

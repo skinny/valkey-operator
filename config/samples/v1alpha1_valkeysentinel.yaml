@@ -30,6 +30,9 @@ spec:
       cpu: "50m"
     limits:
       memory: "128Mi"
+  # Anti-affine sentinel pods of this set so a node loss does not take
+  # the whole quorum down. The selector must match the labels the
+  # operator stamps on sentinel pods (see sentinelSelectorLabels).
   affinity:
     podAntiAffinity:
       preferredDuringSchedulingIgnoredDuringExecution:

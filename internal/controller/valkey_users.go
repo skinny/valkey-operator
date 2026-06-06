@@ -23,6 +23,7 @@ import (
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -113,10 +114,17 @@ func (r *ValkeyReconciler) projectSentinelAuthSecret(ctx context.Context, valkey
 	if valkey.Spec.Replicas == 0 {
 		// Remove if it exists, since standalone has no replication to monitor.
 		old := &corev1.Secret{}
-		if err := r.Get(ctx, client.ObjectKey{
+		err := r.Get(ctx, client.ObjectKey{
 			Name: valkeySentinelAuthSecretName(valkey), Namespace: valkey.Namespace,
-		}, old); err == nil {
-			_ = r.Delete(ctx, old)
+		}, old)
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("get sentinel-auth secret for cleanup: %w", err)
+		}
+		if err := r.Delete(ctx, old); err != nil && !apierrors.IsNotFound(err) {
+			return fmt.Errorf("delete sentinel-auth secret: %w", err)
 		}
 		return nil
 	}

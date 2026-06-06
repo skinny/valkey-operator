@@ -2851,8 +2851,6 @@ spec:
             x-kubernetes-validations:
             - message: persistence cannot be removed once set
               rule: '!has(oldSelf.persistence) || has(self.persistence)'
-            - message: persistence cannot be added after creation
-              rule: has(oldSelf.persistence) || !has(self.persistence)
             - message: persistence.size may only be expanded
               rule: '!has(self.persistence) || !has(oldSelf.persistence) || quantity(self.persistence.size).compareTo(quantity(oldSelf.persistence.size))
                 >= 0'

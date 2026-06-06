@@ -24,6 +24,7 @@ import (
 	"fmt"
 
 	vclient "github.com/valkey-io/valkey-go"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
 )
 
 // Port is the canonical Sentinel TCP port.
@@ -69,18 +70,20 @@ func (c *Client) Remove(ctx context.Context, masterName string) error {
 
 // Masters returns the names of every master this sentinel knows about.
 func (c *Client) Masters(ctx context.Context) ([]string, error) {
+	log := logf.FromContext(ctx)
 	cmd := c.client.B().Arbitrary("SENTINEL", "MASTERS").Build()
 	rows, err := c.client.Do(ctx, cmd).ToArray()
 	if err != nil {
 		return nil, fmt.Errorf("SENTINEL MASTERS on %s: %w", c.addr, err)
 	}
 	out := make([]string, 0, len(rows))
-	for _, row := range rows {
+	for i, row := range rows {
 		// SENTINEL MASTERS returns each entry as a key-value
 		// structure. In RESP2 that's a flat array; in RESP3
 		// valkey-server returns it as a Map. AsStrMap handles both.
 		fields, err := row.AsStrMap()
 		if err != nil {
+			log.V(1).Info("SENTINEL MASTERS: skipping malformed entry", "addr", c.addr, "index", i, "err", err)
 			continue
 		}
 		if name := fields["name"]; name != "" {

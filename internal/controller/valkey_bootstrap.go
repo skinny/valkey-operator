@@ -23,6 +23,7 @@ import (
 	"strings"
 
 	vclient "github.com/valkey-io/valkey-go"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -57,7 +58,7 @@ func (r *ValkeyReconciler) bootstrapReplication(ctx context.Context, valkey *val
 			return nil
 		}
 		if valkey.Spec.Persistence != nil {
-			r.Recorder.Eventf(valkey, nil, "Warning", "ReplicationLost", "Bootstrap",
+			r.Recorder.Eventf(valkey, nil, corev1.EventTypeWarning, "ReplicationLost", "Bootstrap",
 				"All data pods report role:master with no replicas connected, but persistence is enabled; refusing to auto-rebootstrap (would discard replica RDBs). Manual intervention required.")
 			r.setCondition(valkey, valkeyiov1alpha1.ConditionDegraded,
 				"ReplicationLostWithPersistence",
@@ -66,7 +67,7 @@ func (r *ValkeyReconciler) bootstrapReplication(ctx context.Context, valkey *val
 			return nil
 		}
 		log.Info("re-bootstrapping after replication collapse (no persistence; safe to rewire)")
-		r.Recorder.Eventf(valkey, nil, "Warning", "ReplicationLost", "Bootstrap",
+		r.Recorder.Eventf(valkey, nil, corev1.EventTypeWarning, "ReplicationLost", "Bootstrap",
 			"All data pods report role:master with no replicas; re-running bootstrap")
 		meta.RemoveStatusCondition(&valkey.Status.Conditions, valkeyiov1alpha1.ConditionBootstrapped)
 	}
@@ -87,10 +88,16 @@ func (r *ValkeyReconciler) bootstrapReplication(ctx context.Context, valkey *val
 	}
 
 	log.Info("bootstrapping replication", "primary", primary.Name)
-	if err := withDataClient(primary.Status.PodIP, operatorPassword, func(c vclient.Client) error {
-		return c.Do(ctx, c.B().Replicaof().No().One().Build()).Error()
-	}); err != nil {
-		return fmt.Errorf("promote primary: %w", err)
+	// Skip REPLICAOF NO ONE when node-0 already reports role:master to
+	// avoid an unnecessary CONFIG rewrite on every reconcile when
+	// bootstrap is retried.
+	info, err := infoReplication(ctx, primary.Status.PodIP, operatorPassword)
+	if err != nil || strings.TrimSpace(info["role"]) != RoleMaster {
+		if err := withDataClient(primary.Status.PodIP, operatorPassword, func(c vclient.Client) error {
+			return c.Do(ctx, c.B().Replicaof().No().One().Build()).Error()
+		}); err != nil {
+			return fmt.Errorf("promote primary: %w", err)
+		}
 	}
 	for _, replica := range replicas {
 		ip := replica.Status.PodIP
@@ -100,7 +107,7 @@ func (r *ValkeyReconciler) bootstrapReplication(ctx context.Context, valkey *val
 			return fmt.Errorf("REPLICAOF on %s: %w", ip, err)
 		}
 	}
-	r.Recorder.Eventf(valkey, primary, "Normal", "ReplicationBootstrapped", "Bootstrap",
+	r.Recorder.Eventf(valkey, primary, corev1.EventTypeNormal, "ReplicationBootstrapped", "Bootstrap",
 		"Initial primary is %s; %d replica(s) wired", primary.Name, len(replicas))
 	r.setCondition(valkey, valkeyiov1alpha1.ConditionBootstrapped, "BootstrapComplete",
 		fmt.Sprintf("Initial REPLICAOF wiring complete (primary: %s)", primary.Name),

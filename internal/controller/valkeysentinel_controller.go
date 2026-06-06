@@ -62,6 +62,7 @@ type ValkeySentinelReconciler struct {
 
 // +kubebuilder:rbac:groups=valkey.io,resources=valkeysentinels,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=valkey.io,resources=valkeysentinels/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=valkey.io,resources=valkeysentinels/finalizers,verbs=update
 // +kubebuilder:rbac:groups=valkey.io,resources=valkeys,verbs=get;list;watch
 // +kubebuilder:rbac:groups=apps,resources=statefulsets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch;delete
@@ -111,15 +112,22 @@ func (r *ValkeySentinelReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	// in the matched set. Monitor + auth + tuning are now in the
 	// template; no SETs over the wire.
 	monitored := []string{}
+	deferredSweep := false
 	if ss.Status.ReadyReplicas > 0 {
-		monitored, err = r.reconcileMonitoring(ctx, sentinel, monitors)
+		monitored, deferredSweep, err = r.reconcileMonitoring(ctx, sentinel, monitors)
 		if err != nil {
 			log.V(1).Info("monitoring reconcile incomplete; will retry", "err", err)
 		}
 	} else {
+		// All sentinel pods are unready; the stale-sweep can't run.
+		// Treat as deferred so we requeue soon rather than waiting for
+		// a watch event - if a Valkey was just removed from the
+		// selector, the REMOVE wouldn't otherwise fire until something
+		// else triggers reconcile.
 		for _, m := range monitors {
 			monitored = append(monitored, m.Name)
 		}
+		deferredSweep = true
 	}
 	sort.Strings(monitored)
 	sentinel.Status.Monitored = monitored
@@ -128,7 +136,11 @@ func (r *ValkeySentinelReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	if err := r.updateSentinelStatus(ctx, sentinel); err != nil {
 		return ctrl.Result{}, err
 	}
-	return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+	requeueAfter := 30 * time.Second
+	if deferredSweep {
+		requeueAfter = 10 * time.Second
+	}
+	return ctrl.Result{RequeueAfter: requeueAfter}, nil
 }
 
 // findSentinelsForValkey enqueues every ValkeySentinel in the

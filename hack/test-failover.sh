@@ -20,6 +20,14 @@
 #   NS=default VALKEY=cache SENTINEL_CR=valkey-sentinel-monitors \
 #     ./hack/test-failover.sh
 #
+# Environment overrides:
+#   NS, VALKEY, SENTINEL_CR, MASTER_NAME, DATA_PORT, SENT_PORT,
+#   DATA_CONTAINER, SENT_CONTAINER, OPERATOR_NS, POLL_SECS
+#   OUT_DIR    Override the auto-timestamped output directory
+#              (default: failover-debug-YYYYMMDD-HHMMSS in cwd).
+#              Repeated runs accumulate output; either set OUT_DIR
+#              to a throwaway path or `rm -rf failover-debug-*` after.
+#
 # Requirements: kubectl with cluster access; valkey-cli present inside the
 # data/sentinel container images (it is, in the operator's default images).
 
@@ -37,7 +45,7 @@ OPERATOR_NS="${OPERATOR_NS:-valkey-operator-system}"
 POLL_SECS="${POLL_SECS:-90}"
 
 STAMP="$(date +%Y%m%d-%H%M%S)"
-OUT="failover-debug-${STAMP}"
+OUT="${OUT_DIR:-failover-debug-${STAMP}}"
 mkdir -p "$OUT"
 exec > >(tee "$OUT/run.log") 2>&1
 
@@ -53,14 +61,23 @@ section "0. Pod inventory and credentials"
 
 kubectl -n "$NS" get pods -o wide | tee "$OUT/00-pods.txt"
 
-read -r -a VALKEY_PODS <<< "$(kubectl -n "$NS" get pods -l valkey.io/valkey="$VALKEY" -o jsonpath='{.items[*].metadata.name}')"
-read -r -a SENT_PODS   <<< "$(kubectl -n "$NS" get pods -l valkey.io/sentinel="$SENTINEL_CR" -o jsonpath='{.items[*].metadata.name}')"
+# Only enumerate Ready pods; running INFO / SENTINEL against a Pending
+# or NotReady pod produces a confusing "container not found" or
+# "Connection refused" that masks the actual replication state we're
+# trying to inspect.
+ready_pods() {
+  kubectl -n "$NS" get pods -l "$1" \
+    -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.status.conditions[?(@.type=="Ready")].status}{"\n"}{end}' \
+    | awk '$2=="True"{print $1}' | tr '\n' ' '
+}
+read -r -a VALKEY_PODS <<< "$(ready_pods "valkey.io/valkey=$VALKEY")"
+read -r -a SENT_PODS   <<< "$(ready_pods "valkey.io/sentinel=$SENTINEL_CR")"
 
-log "Valkey pods   (${#VALKEY_PODS[@]}): ${VALKEY_PODS[*]:-NONE}"
-log "Sentinel pods (${#SENT_PODS[@]}):   ${SENT_PODS[*]:-NONE}"
+log "Ready Valkey pods   (${#VALKEY_PODS[@]}): ${VALKEY_PODS[*]:-NONE}"
+log "Ready Sentinel pods (${#SENT_PODS[@]}):   ${SENT_PODS[*]:-NONE}"
 
-if [[ ${#VALKEY_PODS[@]} -eq 0 ]]; then echo "FATAL: no Valkey pods matched -l valkey.io/valkey=$VALKEY"; exit 1; fi
-if [[ ${#SENT_PODS[@]}   -eq 0 ]]; then echo "FATAL: no Sentinel pods matched -l valkey.io/sentinel=$SENTINEL_CR"; exit 1; fi
+if [[ ${#VALKEY_PODS[@]} -eq 0 || -z "${VALKEY_PODS[0]:-}" ]]; then echo "FATAL: no Ready Valkey pods matched -l valkey.io/valkey=$VALKEY"; exit 1; fi
+if [[ ${#SENT_PODS[@]}   -eq 0 || -z "${SENT_PODS[0]:-}"   ]]; then echo "FATAL: no Ready Sentinel pods matched -l valkey.io/sentinel=$SENTINEL_CR"; exit 1; fi
 
 SENT_USER=$(kubectl -n "$NS" get secret "${VALKEY}-sentinel-auth" -o jsonpath='{.data.username}' | base64 -d)
 SENT_PASS=$(kubectl -n "$NS" get secret "${VALKEY}-sentinel-auth" -o jsonpath='{.data.password}' | base64 -d)
@@ -68,8 +85,12 @@ if [[ -z "$SENT_USER" || -z "$SENT_PASS" ]]; then echo "FATAL: empty creds in ${
 log "Sentinel auth user: $SENT_USER (pass redacted, len=${#SENT_PASS})"
 
 # Helpers ---------------------------------------------------------------------
-v_cli()    { kubectl -n "$NS" exec "$1" -c "$DATA_CONTAINER" -- valkey-cli --no-auth-warning --user "$SENT_USER" --pass "$SENT_PASS" -p "$DATA_PORT" "${@:2}"; }
-v_cli_h()  { kubectl -n "$NS" exec "${SENT_PODS[0]}" -c "$SENT_CONTAINER" -- valkey-cli --no-auth-warning --user "$SENT_USER" --pass "$SENT_PASS" -h "$1" -p "$DATA_PORT" "${@:2}"; }
+# Pass the password through stdin into REDISCLI_AUTH (valkey-cli reads
+# that env var) rather than `--pass`, which would expose the password
+# in `ps` and audit logs on the kubelet node. Stdin-then-env keeps the
+# secret out of every process listing involved in the exec.
+v_cli()    { printf '%s' "$SENT_PASS" | kubectl -n "$NS" exec -i "$1" -c "$DATA_CONTAINER" -- sh -c 'REDISCLI_AUTH="$(cat)" exec valkey-cli --no-auth-warning --user "$1" -p "$2" "${@:3}"' _ "$SENT_USER" "$DATA_PORT" "${@:2}"; }
+v_cli_h()  { printf '%s' "$SENT_PASS" | kubectl -n "$NS" exec -i "${SENT_PODS[0]}" -c "$SENT_CONTAINER" -- sh -c 'REDISCLI_AUTH="$(cat)" exec valkey-cli --no-auth-warning --user "$1" -h "$2" -p "$3" "${@:4}"' _ "$SENT_USER" "$1" "$DATA_PORT" "${@:2}"; }
 s_cli()    { kubectl -n "$NS" exec "$1" -c "$SENT_CONTAINER" -- valkey-cli -p "$SENT_PORT" "${@:2}"; }
 pod_ip()   { kubectl -n "$NS" get pod "$1" -o jsonpath='{.status.podIP}'; }
 

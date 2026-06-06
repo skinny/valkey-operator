@@ -30,6 +30,7 @@ const SentinelPort = 26379
 // that monitor every Valkey in the same namespace whose labels match
 // `spec.valkeySelector`. The link is one-way: sentinels pick their
 // targets; the data side is unaware.
+// +kubebuilder:validation:XValidation:rule="!has(self.quorum) || self.quorum <= self.replicas",message="quorum must be <= replicas"
 type ValkeySentinelSpec struct {
 	// Image overrides the container image used for the sentinel pods.
 	// +optional
@@ -135,6 +136,7 @@ type ValkeySentinelStatus struct {
 // +kubebuilder:printcolumn:name="State",type="string",JSONPath=".status.state"
 // +kubebuilder:printcolumn:name="Replicas",type="integer",JSONPath=".spec.replicas"
 // +kubebuilder:printcolumn:name="Ready",type="integer",JSONPath=".status.readyReplicas",priority=1
+// +kubebuilder:printcolumn:name="Monitored",type="string",JSONPath=".status.monitored[*]",description="Valkeys currently monitored by this sentinel set"
 // +kubebuilder:printcolumn:name="Age",type="date",JSONPath=".metadata.creationTimestamp"
 type ValkeySentinel struct {
 	metav1.TypeMeta `json:",inline"`

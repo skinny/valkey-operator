@@ -205,6 +205,12 @@ const (
 	// never set False again - the operator stays hands-off so that
 	// sentinel-initiated failovers don't fight against re-bootstrap.
 	ConditionBootstrapped = "Bootstrapped"
+	// ConditionMultiplyMonitored is True on a Valkey selected by more
+	// than one ValkeySentinel. Each set renders its own monitor block
+	// independently, so the behaviour is undefined and the user must
+	// adjust labels or selectors to leave exactly one sentinel
+	// monitoring this Valkey.
+	ConditionMultiplyMonitored = "MultiplyMonitored"
 )
 
 const (

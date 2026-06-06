@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"sort"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -74,22 +75,22 @@ func (r *ValkeyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 
 	if err := r.upsertDataService(ctx, valkey); err != nil {
 		r.setCondition(valkey, valkeyiov1alpha1.ConditionReady, "ServiceError", err.Error(), metav1.ConditionFalse)
-		_ = r.updateStatus(ctx, valkey)
+		r.tryUpdateStatus(ctx, valkey)
 		return ctrl.Result{}, err
 	}
 	if err := r.reconcilePDB(ctx, valkey); err != nil {
 		r.setCondition(valkey, valkeyiov1alpha1.ConditionReady, "PDBError", err.Error(), metav1.ConditionFalse)
-		_ = r.updateStatus(ctx, valkey)
+		r.tryUpdateStatus(ctx, valkey)
 		return ctrl.Result{}, err
 	}
 	if err := r.upsertConfigMap(ctx, valkey); err != nil {
 		r.setCondition(valkey, valkeyiov1alpha1.ConditionReady, "ConfigMapError", err.Error(), metav1.ConditionFalse)
-		_ = r.updateStatus(ctx, valkey)
+		r.tryUpdateStatus(ctx, valkey)
 		return ctrl.Result{}, err
 	}
 	if err := r.reconcileACL(ctx, valkey); err != nil {
 		r.setCondition(valkey, valkeyiov1alpha1.ConditionReady, "ACLError", err.Error(), metav1.ConditionFalse)
-		_ = r.updateStatus(ctx, valkey)
+		r.tryUpdateStatus(ctx, valkey)
 		return ctrl.Result{}, err
 	}
 
@@ -104,16 +105,23 @@ func (r *ValkeyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		r.Recorder.Eventf(valkey, nil, corev1.EventTypeWarning,
 			"MultipleSentinelsSelecting", "Observe",
 			"More than one ValkeySentinel selects this Valkey: %v - each renders the master into its own ConfigMap; behaviour is undefined", monitoredBy)
+		r.setCondition(valkey, valkeyiov1alpha1.ConditionMultiplyMonitored, "MultipleSentinelsSelecting",
+			"More than one ValkeySentinel selects this Valkey: "+strings.Join(monitoredBy, ", ")+
+				" - each renders the master into its own ConfigMap; adjust selectors so exactly one matches",
+			metav1.ConditionTrue)
+	} else {
+		r.setCondition(valkey, valkeyiov1alpha1.ConditionMultiplyMonitored, "Unique",
+			"At most one ValkeySentinel selects this Valkey", metav1.ConditionFalse)
 	}
 
 	if requeue, err := r.reconcileNodes(ctx, valkey); err != nil {
 		r.setCondition(valkey, valkeyiov1alpha1.ConditionReady, "ValkeyNodeError", err.Error(), metav1.ConditionFalse)
-		_ = r.updateStatus(ctx, valkey)
+		r.tryUpdateStatus(ctx, valkey)
 		return ctrl.Result{}, err
 	} else if requeue {
 		r.setCondition(valkey, valkeyiov1alpha1.ConditionReady, "UpdatingNodes", "ValkeyNodes are updating", metav1.ConditionFalse)
 		r.setCondition(valkey, valkeyiov1alpha1.ConditionProgressing, "UpdatingNodes", "ValkeyNodes are updating", metav1.ConditionTrue)
-		_ = r.updateStatus(ctx, valkey)
+		r.tryUpdateStatus(ctx, valkey)
 		return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
 	}
 
@@ -125,8 +133,8 @@ func (r *ValkeyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	if valkey.Spec.Replicas > 0 {
 		if err := r.bootstrapReplication(ctx, valkey, nodes); err != nil {
 			r.setCondition(valkey, valkeyiov1alpha1.ConditionReady, "BootstrapError", err.Error(), metav1.ConditionFalse)
-			_ = r.updateStatus(ctx, valkey)
-			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+			r.tryUpdateStatus(ctx, valkey)
+			return ctrl.Result{}, err
 		}
 	}
 
@@ -240,4 +248,14 @@ func (r *ValkeyReconciler) setCondition(valkey *valkeyiov1alpha1.Valkey, condTyp
 		Message:            message,
 		ObservedGeneration: valkey.Generation,
 	})
+}
+
+// tryUpdateStatus writes status on best-effort and logs the failure
+// rather than swallowing it - the caller is already returning the
+// primary error, so a status-write failure should not mask it but must
+// still leave a trace.
+func (r *ValkeyReconciler) tryUpdateStatus(ctx context.Context, valkey *valkeyiov1alpha1.Valkey) {
+	if err := r.updateStatus(ctx, valkey); err != nil {
+		logf.FromContext(ctx).Error(err, "update Valkey status")
+	}
 }

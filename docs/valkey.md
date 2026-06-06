@@ -58,6 +58,18 @@ option names.
 Same shape and semantics as `ValkeyCluster`. See its
 [reference](./valkeycluster.md) for details.
 
+#### Persistence immutability
+
+`spec.persistence` is partially immutable to avoid silent data loss:
+
+* **Add**: allowed (a Valkey created without persistence can be updated
+  to enable it later; the operator rolls the data pods with the new PVC).
+* **Remove**: rejected. Going from persisted to non-persisted would
+  detach the on-disk data; opt out by recreating the Valkey.
+* **Resize**: only expansion is allowed (`persistence.size` may grow,
+  not shrink).
+* **`storageClassName`**: immutable once set.
+
 ## How sentinel monitoring works (high level)
 
 The `Valkey` CR itself never references a sentinel. The link is
