@@ -34,6 +34,7 @@ const (
 
 // ValkeyNodeSpec defines the desired state of ValkeyNode.
 // +kubebuilder:validation:XValidation:rule="!(has(self.persistence) && self.workloadType == 'Deployment')",message="persistence requires workloadType StatefulSet"
+// +kubebuilder:validation:XValidation:rule="!(has(self.persistWritableConfig) && self.persistWritableConfig && self.workloadType == 'Deployment')",message="persistWritableConfig requires workloadType StatefulSet"
 // +kubebuilder:validation:XValidation:rule="!has(oldSelf.persistence) || has(self.persistence)",message="persistence cannot be removed once set"
 // +kubebuilder:validation:XValidation:rule="has(oldSelf.persistence) || !has(self.persistence)",message="persistence cannot be added after creation"
 // +kubebuilder:validation:XValidation:rule="!has(self.persistence) || !has(oldSelf.persistence) || quantity(self.persistence.size).compareTo(quantity(oldSelf.persistence.size)) >= 0",message="persistence.size may only be expanded"
@@ -101,6 +102,30 @@ type ValkeyNodeSpec struct {
 	// TLS configuration for the node
 	// +optional
 	TLS *TLSConfig `json:"tls,omitempty"`
+
+	// PersistWritableConfig opts the writable copy of valkey.conf into a
+	// VolumeClaimTemplate-backed PVC instead of an emptyDir. CONFIG
+	// REWRITE - issued every time the operator (or Sentinel) wires up
+	// replication on a pod - persists directives to the writable file.
+	// With emptyDir the file is wiped on pod recreation, so a cycled
+	// replica boots as a master until the operator's recovery path
+	// re-issues REPLICAOF; persisting the writable file eliminates that
+	// transient multi-master window entirely.
+	//
+	// Set automatically by the Valkey (replication) controller.
+	// ValkeyCluster does NOT set it: cluster mode's role state lives in
+	// nodes.conf on the data PVC, so writable-config persistence buys
+	// nothing there and adding a new VolumeClaimTemplates entry to
+	// existing ValkeyCluster StatefulSets would fail (VCT is immutable
+	// after creation).
+	//
+	// This field is immutable after creation for the same reason: the
+	// ValkeyNode controller refuses to toggle persistence on an
+	// existing StatefulSet to keep error surfaces visible. Recreate the
+	// parent CR to switch modes.
+	// +optional
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="persistWritableConfig is immutable"
+	PersistWritableConfig bool `json:"persistWritableConfig,omitempty"`
 }
 
 // ValkeyNodeStatus defines the observed state of ValkeyNode.

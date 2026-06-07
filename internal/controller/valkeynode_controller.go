@@ -59,6 +59,7 @@ type ValkeyNodeReconciler struct {
 // +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="apps",resources=statefulsets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="apps",resources=deployments,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=create;patch
@@ -108,8 +109,14 @@ func (r *ValkeyNodeReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 func (r *ValkeyNodeReconciler) ensureWorkload(ctx context.Context, node *valkeyiov1alpha1.ValkeyNode) error {
 	switch node.Spec.WorkloadType {
 	case valkeyiov1alpha1.WorkloadTypeStatefulSet:
+		if err := r.ensureService(ctx, node); err != nil {
+			return fmt.Errorf("ensure service: %w", err)
+		}
 		return r.ensureStatefulSet(ctx, node)
 	case valkeyiov1alpha1.WorkloadTypeDeployment:
+		if err := r.ensureService(ctx, node); err != nil {
+			return fmt.Errorf("ensure service: %w", err)
+		}
 		return r.ensureDeployment(ctx, node)
 	default:
 		return fmt.Errorf("unsupported workload type: %q", node.Spec.WorkloadType)
@@ -119,6 +126,17 @@ func (r *ValkeyNodeReconciler) ensureWorkload(ctx context.Context, node *valkeyi
 // buildPodTemplateAnnotations assembles the annotations that must be present on
 // the pod template spec to trigger rolling updates when the ACL secret or the
 // server config changes.
+// aclSecretNameForNode returns the name of the ACL Secret to mount for
+// this ValkeyNode. Prefers the explicit spec.usersACLSecretName field
+// (set by parents like Valkey) and falls back to the legacy
+// label-based lookup keyed on valkey.io/cluster (set by ValkeyCluster).
+func aclSecretNameForNode(node *valkeyiov1alpha1.ValkeyNode) string {
+	if node.Spec.UsersACLSecretName != "" {
+		return node.Spec.UsersACLSecretName
+	}
+	return getInternalSecretName(node.Labels[LabelCluster])
+}
+
 func buildPodTemplateAnnotations(node *valkeyiov1alpha1.ValkeyNode, aclSecret *corev1.Secret) map[string]string {
 	annotations := map[string]string{
 		hashAnnotationKey: aclSecret.Annotations[hashAnnotationKey],
@@ -127,6 +145,31 @@ func buildPodTemplateAnnotations(node *valkeyiov1alpha1.ValkeyNode, aclSecret *c
 		annotations[configHashKey] = node.Spec.ServerConfigHash
 	}
 	return annotations
+}
+
+// ensureService creates/updates the per-ValkeyNode headless Service.
+// Its name matches the StatefulSet's ServiceName so the pod's DNS
+// hostname resolves through this Service. Sentinel monitors the data
+// node by this hostname (NOT by pod IP), so pod restarts that change
+// the IP don't leave stale `known-replica` entries in sentinel.conf.
+func (r *ValkeyNodeReconciler) ensureService(ctx context.Context, node *valkeyiov1alpha1.ValkeyNode) error {
+	desired := buildValkeyNodeService(node)
+	svc := &corev1.Service{ObjectMeta: metav1.ObjectMeta{
+		Name: desired.Name, Namespace: desired.Namespace,
+	}}
+	_, err := controllerutil.CreateOrUpdate(ctx, r.Client, svc, func() error {
+		svc.Labels = desired.Labels
+		// Preserve ClusterIP (immutable after creation).
+		if svc.Spec.ClusterIP == "" {
+			svc.Spec.ClusterIP = desired.Spec.ClusterIP
+		}
+		svc.Spec.Type = desired.Spec.Type
+		svc.Spec.PublishNotReadyAddresses = desired.Spec.PublishNotReadyAddresses
+		svc.Spec.Selector = desired.Spec.Selector
+		svc.Spec.Ports = desired.Spec.Ports
+		return controllerutil.SetControllerReference(node, svc, r.Scheme)
+	})
+	return err
 }
 
 // ensureStatefulSet creates or updates the StatefulSet for the ValkeyNode.
@@ -143,7 +186,7 @@ func (r *ValkeyNodeReconciler) ensureStatefulSet(ctx context.Context, node *valk
 		},
 	}
 	log.V(1).Info("getting internal secret", "node-labels", desired.Labels)
-	aclSecretName := getInternalSecretName(desired.Labels[LabelCluster])
+	aclSecretName := aclSecretNameForNode(node)
 	aclSecret := &corev1.Secret{}
 	err = r.Get(ctx, types.NamespacedName{
 		Name:      aclSecretName,
@@ -153,6 +196,15 @@ func (r *ValkeyNodeReconciler) ensureStatefulSet(ctx context.Context, node *valk
 		return err
 	}
 	result, err := controllerutil.CreateOrUpdate(ctx, r.Client, sts, func() error {
+		// VolumeClaimTemplates is immutable after SS creation. Toggling
+		// PersistWritableConfig on an existing ValkeyNode would silently
+		// fail at apply time; surface a clear error instead so the user
+		// recreates the parent CR to switch modes.
+		if !sts.CreationTimestamp.IsZero() {
+			if err := assertWritableConfigImmutable(sts, desired); err != nil {
+				return err
+			}
+		}
 		sts.Labels = desired.Labels
 		sts.Spec = desired.Spec
 		sts.Spec.Template.Annotations = buildPodTemplateAnnotations(node, aclSecret)
@@ -163,6 +215,34 @@ func (r *ValkeyNodeReconciler) ensureStatefulSet(ctx context.Context, node *valk
 	}
 	log.V(1).Info("reconciled StatefulSet", "result", result, "name", sts.Name)
 	return nil
+}
+
+// assertWritableConfigImmutable refuses to reconcile when the
+// writable-config volume backing changed between SS create and now.
+// Adding or removing a VolumeClaimTemplates entry on an existing
+// StatefulSet is rejected by the API server; surfacing it as a
+// reconcile error keeps the failure visible and instructs the user how
+// to recover (recreate the parent CR) instead of letting the reconcile
+// loop spin on opaque admission rejections.
+func assertWritableConfigImmutable(existing, desired *appsv1.StatefulSet) error {
+	existingHas := hasWritableConfigVCT(existing)
+	desiredHas := hasWritableConfigVCT(desired)
+	if existingHas == desiredHas {
+		return nil
+	}
+	if existingHas && !desiredHas {
+		return fmt.Errorf("cannot disable writable-config persistence on an existing ValkeyNode: StatefulSet.VolumeClaimTemplates is immutable. Delete and recreate the parent CR to switch modes")
+	}
+	return fmt.Errorf("cannot enable writable-config persistence on an existing ValkeyNode: StatefulSet.VolumeClaimTemplates is immutable. Delete and recreate the parent CR to switch modes")
+}
+
+func hasWritableConfigVCT(sts *appsv1.StatefulSet) bool {
+	for _, t := range sts.Spec.VolumeClaimTemplates {
+		if t.Name == writableConfigVolumeName {
+			return true
+		}
+	}
+	return false
 }
 
 // ensureDeployment creates or updates the Deployment for the ValkeyNode.
@@ -179,7 +259,7 @@ func (r *ValkeyNodeReconciler) ensureDeployment(ctx context.Context, node *valke
 		},
 	}
 	log.V(1).Info("getting internal secret", "node-labels", desired.Labels)
-	aclSecretName := getInternalSecretName(desired.Labels[LabelCluster])
+	aclSecretName := aclSecretNameForNode(node)
 	aclSecret := &corev1.Secret{}
 	err = r.Get(ctx, types.NamespacedName{
 		Name:      aclSecretName,
@@ -368,15 +448,25 @@ func (r *ValkeyNodeReconciler) updateStatus(ctx context.Context, node *valkeyiov
 }
 
 // isWorkloadRolledOut returns true if the workload (StatefulSet or Deployment)
-// has fully rolled out to the current spec — all pods are on the latest revision
-// and ready. The pod's own Ready condition is not sufficient: the old pod may
-// still be running while the StatefulSet/Deployment is rolling to a new spec.
+// has fully rolled out to the current spec — pod is ready and, for the legacy
+// auto-rolling case, on the latest revision.
 //
-// The check uses two gates for StatefulSets:
-//  1. status.observedGeneration >= metadata.generation — the STS controller has
-//     processed the latest spec (and computed the new updateRevision).
-//  2. status.currentRevision == status.updateRevision — all pods are on the
-//     new revision (the rolling update has completed).
+// Strategy semantics:
+//
+//   - StatefulSet/RollingUpdate: the StatefulSet controller cycles pods on its
+//     own. CurrentRevision != UpdateRevision means a rollout is in progress and
+//     the operator should NOT advance to dependent work yet (cluster bring-up,
+//     bootstrap, etc.). Both gates apply.
+//
+//   - StatefulSet/OnDelete: the operator drives pod replacement order (see
+//     internal/controller/valkey_rollout.go). After a spec patch,
+//     CurrentRevision != UpdateRevision is the PERSISTENT steady state until
+//     the operator deletes the pod. Treating that drift as "not ready" creates
+//     a deadlock: the rollout executor waits for ValkeyNode.Status.Ready, and
+//     ValkeyNode.Status.Ready waits for the rollout to advance the revision.
+//     So with OnDelete we only check that the SS controller has observed the
+//     spec change and the pod itself is ready - revision drift is the rollout
+//     executor's responsibility, not this readiness check's.
 func (r *ValkeyNodeReconciler) isWorkloadRolledOut(ctx context.Context, node *valkeyiov1alpha1.ValkeyNode) (bool, error) {
 	// Use APIReader (direct API server read) when available so we always see the
 	// latest metadata.generation, bypassing the informer cache. Without this, the
@@ -395,12 +485,20 @@ func (r *ValkeyNodeReconciler) isWorkloadRolledOut(ctx context.Context, node *va
 		if err := reader.Get(ctx, client.ObjectKey{Name: valkeyNodeResourceName(node), Namespace: node.Namespace}, sts); err != nil {
 			return false, client.IgnoreNotFound(err)
 		}
-		// Gate 1: STS controller hasn't processed the latest spec change yet.
+		// Gate 1 (always): STS controller hasn't processed the latest spec change yet.
 		if sts.Status.ObservedGeneration < sts.Generation {
 			return false, nil
 		}
-		// Gate 2: rolling update not yet complete.
-		return sts.Status.CurrentRevision == sts.Status.UpdateRevision && sts.Status.ReadyReplicas >= 1, nil
+		if sts.Status.ReadyReplicas < 1 {
+			return false, nil
+		}
+		// Gate 2: revision equality is only meaningful under RollingUpdate.
+		// Under OnDelete, drift is intentional and operator-managed; see the
+		// function doc.
+		if sts.Spec.UpdateStrategy.Type == appsv1.OnDeleteStatefulSetStrategyType {
+			return true, nil
+		}
+		return sts.Status.CurrentRevision == sts.Status.UpdateRevision, nil
 	case valkeyiov1alpha1.WorkloadTypeDeployment:
 		dep := &appsv1.Deployment{}
 		if err := reader.Get(ctx, client.ObjectKey{Name: valkeyNodeResourceName(node), Namespace: node.Namespace}, dep); err != nil {

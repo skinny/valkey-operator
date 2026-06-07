@@ -18,12 +18,14 @@ package controller
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -928,6 +930,48 @@ var _ = Describe("isWorkloadRolledOut", func() {
 			Expect(rolled).To(BeFalse())
 		})
 
+		It("returns true under OnDelete even when CurrentRevision != UpdateRevision", func() {
+			// Regression: with OnDelete the operator drives pod
+			// replacement order via the rollout executor; revision drift
+			// between CurrentRevision and UpdateRevision is the persistent
+			// steady state until the operator deletes a pod. Treating
+			// that drift as "not ready" deadlocked the rollout (executor
+			// waits for nodes Ready; nodes wait for executor to advance
+			// the revision).
+			r := makeReconciler()
+			replicas := int32(1)
+			stsName4 := types.NamespacedName{Name: "valkey-" + nodeName + "-ondel", Namespace: ns}
+			node4 := makeNode(nodeName+"-ondel", valkeyiov1alpha1.WorkloadTypeStatefulSet)
+			sts := &appsv1.StatefulSet{
+				ObjectMeta: metav1.ObjectMeta{Name: stsName4.Name, Namespace: stsName4.Namespace},
+				Spec: appsv1.StatefulSetSpec{
+					Replicas: &replicas,
+					Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": node4.Name}},
+					Template: corev1.PodTemplateSpec{
+						ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": node4.Name}},
+						Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "c", Image: "valkey/valkey:9.0.0"}}},
+					},
+					UpdateStrategy: appsv1.StatefulSetUpdateStrategy{
+						Type: appsv1.OnDeleteStatefulSetStrategyType,
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, sts)).To(Succeed())
+			defer func() { _ = k8sClient.Delete(ctx, sts) }()
+
+			Expect(k8sClient.Get(ctx, stsName4, sts)).To(Succeed())
+			sts.Status.ObservedGeneration = sts.Generation
+			sts.Status.Replicas = 1
+			sts.Status.ReadyReplicas = 1
+			sts.Status.CurrentRevision = "old-rev"
+			sts.Status.UpdateRevision = "new-rev"
+			Expect(k8sClient.Status().Update(ctx, sts)).To(Succeed())
+
+			rolled, err := r.isWorkloadRolledOut(ctx, node4)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(rolled).To(BeTrue(), "OnDelete drift must NOT block readiness")
+		})
+
 		It("returns true when fully rolled out", func() {
 			r := makeReconciler()
 			replicas := int32(1)
@@ -1018,6 +1062,73 @@ var _ = Describe("isWorkloadRolledOut", func() {
 			Expect(err).NotTo(HaveOccurred())
 			Expect(rolled).To(BeTrue())
 		})
+	})
+})
+
+var _ = Describe("StatefulSet spec stability against the API server", func() {
+	// Regression for the rollout loop: the executor would correctly
+	// delete a pod, the pod would come back, and ~12s later the executor
+	// would delete it again. Cause: controllerutil.CreateOrUpdate did
+	// `sts.Spec = desired.Spec`, the API server defaulted fields that
+	// our builder left unset, and the next reconcile saw a diff (a new
+	// updateRevision) and the rollout observer thought the pod was
+	// pending again.
+	//
+	// This test catches the WHOLE class of bugs: build the SS, create
+	// it through the real API server (which applies all v1 defaults),
+	// re-read it, build a fresh desired SS, and assert the live spec
+	// equals the desired spec. If any field is defaulted that the
+	// builder doesn't pre-populate, the comparison fails and the test
+	// names the field.
+	ctx := context.Background()
+
+	assertStableSS := func(node *valkeyiov1alpha1.ValkeyNode) {
+		GinkgoHelper()
+		desired, err := buildValkeyNodeStatefulSet(node)
+		Expect(err).NotTo(HaveOccurred())
+
+		// Strip metadata that the API server owns - we only care about Spec.
+		desired.ResourceVersion = ""
+		Expect(k8sClient.Create(ctx, desired)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, desired) })
+
+		live := &appsv1.StatefulSet{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: desired.Name, Namespace: desired.Namespace}, live)).To(Succeed())
+
+		// Rebuild the same SS - identical input must yield identical
+		// output (already covered by TestBuildValkeyNodeStatefulSet,
+		// but the assertion lives in this test too so the failure
+		// message is co-located).
+		rebuilt, err := buildValkeyNodeStatefulSet(node)
+		Expect(err).NotTo(HaveOccurred())
+
+		// The flap signature: rebuilt.Spec differs from live.Spec.
+		// equality.Semantic.DeepEqual ignores some encoding differences
+		// (nil vs empty slices, time precision) so when it fails it
+		// names a real, persistent diff.
+		if !equality.Semantic.DeepEqual(live.Spec, rebuilt.Spec) {
+			// Spew both to make the diff obvious in the failure log.
+			Fail(fmt.Sprintf(
+				"spec drift between API-server-stored and freshly built SS - this is the source of the rollout loop.\nLIVE:\n%#v\n\nDESIRED:\n%#v",
+				live.Spec, rebuilt.Spec))
+		}
+	}
+
+	It("a freshly built StatefulSet spec matches the API-server-defaulted version", func() {
+		assertStableSS(newTestValkeyNode("flap-check", "default"))
+	})
+
+	// Exporter-enabled regression: the metrics-exporter sidecar's
+	// LivenessProbe / ReadinessProbe were built without explicit
+	// SuccessThreshold, FailureThreshold, and HTTPGet.Scheme. The API
+	// server filled those in on UPDATE, and the next reconcile saw a
+	// diff and bumped updateRevision again - which is what kept the
+	// rollout executor deleting the same replica pod every ~10s in a
+	// live cluster with exporter.enabled=true.
+	It("is stable when the metrics-exporter sidecar is enabled", func() {
+		node := newTestValkeyNode("flap-check-exporter", "default")
+		node.Spec.Exporter = valkeyiov1alpha1.ExporterSpec{Enabled: true}
+		assertStableSS(node)
 	})
 })
 

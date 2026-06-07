@@ -193,11 +193,29 @@ type ValkeyClusterStatus struct {
 }
 
 const (
-	ConditionReady         = "Ready"
-	ConditionProgressing   = "Progressing"
-	ConditionDegraded      = "Degraded"
-	ConditionClusterFormed = "ClusterFormed"
-	ConditionSlotsAssigned = "SlotsAssigned"
+	ConditionReady          = "Ready"
+	ConditionProgressing    = "Progressing"
+	ConditionDegraded       = "Degraded"
+	ConditionClusterFormed  = "ClusterFormed"
+	ConditionSlotsAssigned  = "SlotsAssigned"
+	ConditionPrimaryElected = "PrimaryElected"
+	ConditionMonitored      = "Monitored"
+	// ConditionBootstrapped is set on a Valkey once the operator has
+	// completed the one-shot initial REPLICAOF wiring. Once True it is
+	// never set False again - the operator stays hands-off so that
+	// sentinel-initiated failovers don't fight against re-bootstrap.
+	ConditionBootstrapped = "Bootstrapped"
+	// ConditionMultiplyMonitored is True on a Valkey selected by more
+	// than one ValkeySentinel. Each set renders its own monitor block
+	// independently, so the behaviour is undefined and the user must
+	// adjust labels or selectors to leave exactly one sentinel
+	// monitoring this Valkey.
+	ConditionMultiplyMonitored = "MultiplyMonitored"
+	// ConditionRolling reflects an operator-driven rolling restart in
+	// progress. True while pods are being cycled to converge on the
+	// latest pod template, False otherwise. The message names the
+	// current phase (replicas / failover / primary).
+	ConditionRolling = "Rolling"
 )
 
 const (

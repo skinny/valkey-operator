@@ -60,6 +60,9 @@ var (
 			"+cluster|getslotmigrations", // check migration status
 			"+cluster|migrateslots",      // migrate slots between shards
 			"+info",                      // node info and replication status
+			"+replicaof",                 // initial REPLICAOF wiring (Valkey CR bootstrap)
+			"+config|rewrite",            // persist runtime role to disk after REPLICAOF
+			"+dbsize",                    // wireScaledUpReplicas safety: refuse to REPLICAOF a master holding data
 		}, " "),
 		// the ACL rawstring for exporter is taken from the redis_exporter documentation: https://github.com/oliver006/redis_exporter#authenticating-with-redis
 		exporterUser: "-@all +@connection +memory -readonly +strlen +config|get +xinfo +pfcount -quit +zcard +type +xlen -readwrite -command +client -wait +scard +llen +hlen +get +eval +slowlog +cluster|info +cluster|slots +cluster|nodes -hello -echo +info +latency +scan -reset -auth -asking",
