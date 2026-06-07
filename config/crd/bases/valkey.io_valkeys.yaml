@@ -4,44 +4,40 @@ kind: CustomResourceDefinition
 metadata:
   annotations:
     controller-gen.kubebuilder.io/version: v0.20.1
-  name: valkeynodes.valkey.io
+  name: valkeys.valkey.io
 spec:
   group: valkey.io
   names:
-    kind: ValkeyNode
-    listKind: ValkeyNodeList
-    plural: valkeynodes
-    singular: valkeynode
+    kind: Valkey
+    listKind: ValkeyList
+    plural: valkeys
+    shortNames:
+    - vk
+    singular: valkey
   scope: Namespaced
   versions:
   - additionalPrinterColumns:
-    - description: Whether the node is ready
-      jsonPath: .status.ready
-      name: Ready
-      type: boolean
-    - description: Valkey replication role
-      jsonPath: .status.role
-      name: Role
+    - jsonPath: .status.state
+      name: State
       type: string
-    - description: Pod name
-      jsonPath: .status.podName
-      name: Pod
-      type: string
-    - description: Pod IP
-      jsonPath: .status.podIP
-      name: IP
+    - jsonPath: .spec.replicas
+      name: Replicas
+      type: integer
+    - jsonPath: .status.primaryPodName
+      name: Primary
       priority: 1
       type: string
-    - description: Time since creation
-      jsonPath: .metadata.creationTimestamp
+    - description: ValkeySentinels currently monitoring this Valkey (empty = no failover)
+      jsonPath: .status.monitoredBy[*]
+      name: Sentinels
+      type: string
+    - jsonPath: .metadata.creationTimestamp
       name: Age
       type: date
     name: v1alpha1
     schema:
       openAPIV3Schema:
-        description: |-
-          ValkeyNode is the Schema for the valkeynodes API.
-          ValkeyNode is an internal CRD. Users should not create ValkeyNodes directly.
+        description: Valkey is the Schema for the valkeys API.
         properties:
           apiVersion:
             description: |-
@@ -61,10 +57,15 @@ spec:
           metadata:
             type: object
           spec:
-            description: ValkeyNodeSpec defines the desired state of ValkeyNode.
+            description: |-
+              ValkeySpec defines the desired state of Valkey.
+
+              A Valkey is a non-sharded primary+replicas (or standalone) data plane.
+              Failover is delegated to a separately-managed ValkeySentinel that
+              selects this Valkey via labels; this CRD has no sentinelRef.
             properties:
               affinity:
-                description: Affinity defines the pod affinity/anti-affinity rules.
+                description: Affinity applied to every Valkey pod.
                 properties:
                   nodeAffinity:
                     description: Describes node affinity scheduling rules for the
@@ -975,11 +976,24 @@ spec:
                         x-kubernetes-list-type: atomic
                     type: object
                 type: object
-              containers:
+              config:
+                additionalProperties:
+                  type: string
                 description: |-
-                  Containers allows patching the default containers via a strategic merge
-                  patch. Existing containers (e.g. "server", "metrics-exporter") are merged
-                  by name; any container name not present in the defaults is appended.
+                  Config is passthrough configuration written verbatim into
+                  `valkey.conf`. The operator does not validate option values,
+                  but it does reject a small set of keys the operator itself
+                  owns (port/dir/bind/etc.) - setting those would either fight
+                  the rendered config or break the data path.
+                type: object
+                x-kubernetes-validations:
+                - message: config keys port, tls-port, bind, dir, logfile, dbfilename,
+                    pidfile, unixsocket, aclfile, include are owned by the operator
+                    and cannot be overridden
+                  rule: '!self.exists(k, k in [''port'',''tls-port'',''bind'',''dir'',''logfile'',''dbfilename'',''pidfile'',''unixsocket'',''aclfile'',''include''])'
+              containers:
+                description: Containers patches the default container list via strategic
+                  merge.
                 items:
                   description: A single application container that you want to run
                     within a pod.
@@ -2502,7 +2516,9 @@ spec:
                   type: object
                 type: array
               exporter:
-                description: Exporter defines the metrics exporter sidecar configuration.
+                default:
+                  enabled: true
+                description: Exporter configures the optional metrics-exporter sidecar.
                 properties:
                   enabled:
                     description: Enable or disable the exporter sidecar container
@@ -2572,41 +2588,16 @@ spec:
                     type: object
                 type: object
               image:
-                description: Image is the Valkey container image to use.
+                description: Image overrides the default Valkey container image.
                 type: string
               nodeSelector:
                 additionalProperties:
                   type: string
-                description: NodeSelector defines the node selection constraints.
+                description: NodeSelector applied to every Valkey pod.
                 type: object
-              persistWritableConfig:
-                description: |-
-                  PersistWritableConfig opts the writable copy of valkey.conf into a
-                  VolumeClaimTemplate-backed PVC instead of an emptyDir. CONFIG
-                  REWRITE - issued every time the operator (or Sentinel) wires up
-                  replication on a pod - persists directives to the writable file.
-                  With emptyDir the file is wiped on pod recreation, so a cycled
-                  replica boots as a master until the operator's recovery path
-                  re-issues REPLICAOF; persisting the writable file eliminates that
-                  transient multi-master window entirely.
-
-                  Set automatically by the Valkey (replication) controller.
-                  ValkeyCluster does NOT set it: cluster mode's role state lives in
-                  nodes.conf on the data PVC, so writable-config persistence buys
-                  nothing there and adding a new VolumeClaimTemplates entry to
-                  existing ValkeyCluster StatefulSets would fail (VCT is immutable
-                  after creation).
-
-                  This field is immutable after creation for the same reason: the
-                  ValkeyNode controller refuses to toggle persistence on an
-                  existing StatefulSet to keep error surfaces visible. Recreate the
-                  parent CR to switch modes.
-                type: boolean
-                x-kubernetes-validations:
-                - message: persistWritableConfig is immutable
-                  rule: self == oldSelf
               persistence:
-                description: Persistence defines durable storage for the ValkeyNode.
+                description: Persistence defines durable storage propagated to each
+                  ValkeyNode.
                 properties:
                   reclaimPolicy:
                     default: Retain
@@ -2631,6 +2622,22 @@ spec:
                 required:
                 - size
                 type: object
+              podDisruptionBudget:
+                default: Managed
+                description: PodDisruptionBudget controls whether the operator manages
+                  a PDB.
+                enum:
+                - Managed
+                - Disabled
+                type: string
+              replicas:
+                description: |-
+                  Replicas is the number of replicas (not counting the primary).
+                  0 = standalone (one pod, no replication). N > 0 = one primary plus
+                  N replicas. Matches the semantics of ValkeyCluster.spec.replicas.
+                format: int32
+                minimum: 0
+                type: integer
               resources:
                 description: Resources defines the resource requirements for the Valkey
                   container.
@@ -2691,20 +2698,8 @@ spec:
                       More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
                     type: object
                 type: object
-              serverConfigHash:
-                description: |-
-                  ServerConfigHash is a hash of the server ConfigMap contents. When set by
-                  the ValkeyCluster controller it bumps the spec Generation, which triggers
-                  the ValkeyNode controller to reconcile and update the pod template
-                  annotation — causing a rolling restart when the cluster config changes.
-                type: string
-              serverConfigMapName:
-                description: |-
-                  ServerConfigMapName specifies the name of the ConfigMap that contains the
-                  scripts, and Valkey config for the ValkeyNode.
-                type: string
               tls:
-                description: TLS configuration for the node
+                description: TLS configuration for the data port.
                 properties:
                   certificate:
                     description: |-
@@ -2721,7 +2716,7 @@ spec:
                     type: object
                 type: object
               tolerations:
-                description: Tolerations defines the pod tolerations.
+                description: Tolerations applied to every Valkey pod.
                 items:
                   description: |-
                     The pod this Toleration is attached to tolerates any taint that matches
@@ -2760,35 +2755,110 @@ spec:
                       type: string
                   type: object
                 type: array
-              usersACLSecretName:
-                description: |-
-                  UsersACLSecretName is the name of the Secret containing the ACL user
-                  file. When set, mounts a users-acl volume from this Secret so the
-                  container can load aclfile /config/users/users.acl.
-                type: string
-              workloadType:
-                default: StatefulSet
-                description: |-
-                  WorkloadType specifies whether to create a StatefulSet or Deployment.
-                  This field is immutable after creation.
-                enum:
-                - StatefulSet
-                - Deployment
-                type: string
-                x-kubernetes-validations:
-                - message: workloadType is immutable
-                  rule: self == oldSelf
+              users:
+                description: Users and ACL definitions; matches ValkeyCluster.spec.users.
+                items:
+                  description: An UserAclSpec contains user, authorization, and permissions-related
+                    configurations
+                  properties:
+                    channels:
+                      description: Channel restrictions
+                      properties:
+                        patterns:
+                          description: 'Pub/Sub channel patterns - maps to Valkey:
+                            &pattern'
+                          items:
+                            type: string
+                          type: array
+                      type: object
+                    commands:
+                      description: Valkey command categories, commands, and subcommands
+                        restrictions for this user
+                      properties:
+                        allow:
+                          description: Allowed commands for this user
+                          items:
+                            type: string
+                          type: array
+                        deny:
+                          description: Denied commands for this user
+                          items:
+                            type: string
+                          type: array
+                      type: object
+                    enabled:
+                      default: true
+                      description: If the user is enabled or not
+                      type: boolean
+                    keys:
+                      description: Key restrictions
+                      properties:
+                        readOnly:
+                          description: 'Keys restricted to read-only; maps to Valkey:
+                            %R~pattern'
+                          items:
+                            type: string
+                          type: array
+                        readWrite:
+                          description: 'Keys on which this user can read, and write;
+                            maps to Valkey: ~pattern'
+                          items:
+                            type: string
+                          type: array
+                        writeOnly:
+                          description: 'Keys restricted to write-only; maps to Valkey:
+                            %W~pattern'
+                          items:
+                            type: string
+                          type: array
+                      type: object
+                    name:
+                      description: Username
+                      type: string
+                      x-kubernetes-validations:
+                      - message: Username cannot start with '_'
+                        rule: '!self.startsWith(''_'')'
+                    nopass:
+                      default: false
+                      description: Do not apply a password to this user
+                      type: boolean
+                    passwordSecret:
+                      description: Reference information to a Secret containing user
+                        passwords
+                      properties:
+                        keys:
+                          description: |-
+                            An array of keys inside the referencing Secret to find passwords; defaults to username
+                            Valkey supports multiple passwords per user for rotation
+                          items:
+                            type: string
+                          type: array
+                        name:
+                          description: Name of the referencing Secret; Defaults to
+                            clustername-users
+                          type: string
+                      type: object
+                    permissions:
+                      description: Raw ACL for (additional) permissions. Appended
+                        to anything generated.
+                      type: string
+                    resetpass:
+                      default: false
+                      description: Apply the resetpass flag to this user
+                      type: boolean
+                  required:
+                  - name
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - name
+                x-kubernetes-list-type: map
+            required:
+            - replicas
             type: object
             x-kubernetes-validations:
-            - message: persistence requires workloadType StatefulSet
-              rule: '!(has(self.persistence) && self.workloadType == ''Deployment'')'
-            - message: persistWritableConfig requires workloadType StatefulSet
-              rule: '!(has(self.persistWritableConfig) && self.persistWritableConfig
-                && self.workloadType == ''Deployment'')'
             - message: persistence cannot be removed once set
               rule: '!has(oldSelf.persistence) || has(self.persistence)'
-            - message: persistence cannot be added after creation
-              rule: has(oldSelf.persistence) || !has(self.persistence)
             - message: persistence.size may only be expanded
               rule: '!has(self.persistence) || !has(oldSelf.persistence) || quantity(self.persistence.size).compareTo(quantity(oldSelf.persistence.size))
                 >= 0'
@@ -2798,10 +2868,15 @@ spec:
                 && has(oldSelf.persistence.storageClassName) && self.persistence.storageClassName
                 == oldSelf.persistence.storageClassName))'
           status:
-            description: ValkeyNodeStatus defines the observed state of ValkeyNode.
+            default:
+              readyReplicas: 0
+              state: Initializing
+            description: ValkeyStatus defines the observed state of Valkey.
             properties:
               conditions:
-                description: Conditions represent the current state of the ValkeyNode.
+                description: |-
+                  Conditions exposes detailed state.
+                  Standard types: Ready, Progressing, Degraded, PrimaryElected, Monitored.
                 items:
                   description: Condition contains details for one aspect of the current
                     state of this API Resource.
@@ -2860,30 +2935,101 @@ spec:
                 x-kubernetes-list-map-keys:
                 - type
                 x-kubernetes-list-type: map
-              observedGeneration:
+              message:
+                description: Message is a human-readable explanation of the current
+                  state.
+                type: string
+              monitoredBy:
                 description: |-
-                  ObservedGeneration is the most recent generation observed by the controller.
-                  It corresponds to the ValkeyNode's generation, which is updated on mutation
-                  of the spec field.
-                format: int64
+                  MonitoredBy lists the ValkeySentinels in this namespace whose
+                  selector matches this Valkey's labels. Observed, not declared.
+                items:
+                  type: string
+                type: array
+                x-kubernetes-list-type: set
+              primaryEndpoint:
+                description: |-
+                  PrimaryEndpoint is the network endpoint of the current primary,
+                  observed by the operator via INFO replication. Used by selecting
+                  ValkeySentinels so they can render `sentinel monitor` lines into
+                  their ConfigMap without re-probing every reconcile. Empty until
+                  the primary is observed.
+                properties:
+                  host:
+                    description: Host is a DNS name resolvable inside the cluster.
+                    type: string
+                  port:
+                    description: Port is the TCP port.
+                    format: int32
+                    type: integer
+                required:
+                - host
+                - port
+                type: object
+              primaryPodName:
+                description: |-
+                  PrimaryPodName is the name of the pod currently reporting
+                  `role:master`. Empty when no primary is known.
+                type: string
+              readyReplicas:
+                default: 0
+                description: |-
+                  ReadyReplicas is the number of pods other than the primary that
+                  report ready.
+                format: int32
                 type: integer
-              podIP:
-                description: PodIP is the IP address of the pod.
+              reason:
+                description: Reason is a brief machine-readable explanation of the
+                  current state.
                 type: string
-              podName:
-                description: PodName is the name of the pod created by the workload.
-                type: string
-              ready:
-                description: Ready indicates whether the ValkeyNode is ready to serve
-                  traffic.
-                type: boolean
-              role:
-                description: Role is the Valkey replication role of this node (primary
-                  or replica).
+              rollout:
+                description: |-
+                  Rollout exposes the state of any in-progress operator-driven
+                  rolling restart. Phase=Idle (or empty) means no rollout is in
+                  flight; the StatefulSets are using OnDelete updateStrategy so
+                  pods only restart when the operator deletes them. See the
+                  ConditionRolling condition for the user-facing summary.
+                properties:
+                  failoverIssuedAt:
+                    description: |-
+                      FailoverIssuedAt records the last time the rollout state machine
+                      issued a SENTINEL FAILOVER (or operator-driven equivalent). Used
+                      to debounce re-issuance while Sentinel is still working on the
+                      promotion - without this the operator pokes Sentinel on every
+                      reconcile, producing the +sentinel/+sdown event spam observed
+                      during long failovers.
+                    format: date-time
+                    type: string
+                  pendingNodes:
+                    description: |-
+                      PendingNodes lists ValkeyNodes whose pod still runs the previous
+                      template revision and therefore need to be cycled. Sorted by node
+                      index, primary last.
+                    items:
+                      type: string
+                    type: array
+                    x-kubernetes-list-type: set
+                  phase:
+                    description: Phase is the current step of the rollout state machine.
+                    enum:
+                    - Idle
+                    - RollingReplicas
+                    - Failover
+                    - RollingPrimary
+                    type: string
+                type: object
+              state:
+                default: Initializing
+                description: State summarises overall health.
+                enum:
+                - Initializing
+                - Reconciling
+                - Ready
+                - Degraded
+                - Failed
                 type: string
             type: object
         required:
-        - metadata
         - spec
         type: object
     served: true

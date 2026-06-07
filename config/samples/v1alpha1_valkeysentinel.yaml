@@ -1,0 +1,59 @@
+apiVersion: valkey.io/v1alpha1
+kind: ValkeySentinel
+metadata:
+  name: monitors
+spec:
+  # Minimum 3 so a single pod loss does not break quorum.
+  replicas: 3
+  # Selects every Valkey in this namespace with the matching label.
+  valkeySelector:
+    matchLabels:
+      tier: caching
+  # Per-master tuning baked into the rendered sentinel.conf for every
+  # monitored master. The operator never issues SENTINEL SET against
+  # running sentinels in steady state - the template is the source of
+  # truth, and a config-hash annotation triggers a rolling restart
+  # when the rendered content changes.
+  config:
+    down-after-milliseconds: "30000"
+    failover-timeout: "180000"
+    parallel-syncs: "1"
+  # Persistence is opt-in. Sentinel re-discovers known peers and
+  # replicas via INFO and pubsub on restart, and epoch is monotonic
+  # across the surviving quorum, so a freshly-started sentinel
+  # rejoins safely. The default emptyDir avoids a cluster-scoped
+  # StorageClass dependency and matches Sentinel's design intent.
+  #
+  # Set the block below to switch to a per-pod PVC if you want
+  # epoch/myid stability across pod recreation (less event noise
+  # during node drains and SS rolling updates):
+  # persistence:
+  #   size: 100Mi
+  #   # storageClassName: ""        # uses cluster default when unset
+  #   # reclaimPolicy: Retain       # default; Delete frees PVCs on
+  #   #                             # sentinel deletion
+  resources:
+    # No CPU limit on purpose: Sentinel's 10Hz timer trips TILT mode if two
+    # consecutive iterations are >2s apart, and the Linux CFS throttler at a
+    # low CPU limit (e.g. 250m / 25ms per 100ms window) can easily produce
+    # that pause during disk fsyncs of sentinel.conf or sentinel-to-pod
+    # connects, wedging failover in wait_promotion. Sentinel idles at
+    # near-zero CPU; let it burst when it needs to.
+    requests:
+      memory: "64Mi"
+      cpu: "50m"
+    limits:
+      memory: "128Mi"
+  # Anti-affine sentinel pods of this set so a node loss does not take
+  # the whole quorum down. The selector must match the labels the
+  # operator stamps on sentinel pods (see sentinelSelectorLabels).
+  affinity:
+    podAntiAffinity:
+      preferredDuringSchedulingIgnoredDuringExecution:
+        - weight: 100
+          podAffinityTerm:
+            labelSelector:
+              matchLabels:
+                app.kubernetes.io/name: valkey
+                valkey.io/sentinel: monitors
+            topologyKey: kubernetes.io/hostname

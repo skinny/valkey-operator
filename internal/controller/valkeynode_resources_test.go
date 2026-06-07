@@ -21,11 +21,14 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	valkeyv1 "valkey.io/valkey-operator/api/v1alpha1"
@@ -55,6 +58,39 @@ func TestValkeyNodeResourceName_Simple(t *testing.T) {
 	assert.Equal(t, "valkey-foo", valkeyNodeResourceName(node))
 }
 
+func TestValkeyNodeServiceHost(t *testing.T) {
+	node := newTestValkeyNode("cache-0-0", "data")
+	assert.Equal(t, "valkey-cache-0-0.data.svc.cluster.local", valkeyNodeServiceHost(node))
+}
+
+func TestBuildValkeyNodeService(t *testing.T) {
+	node := newTestValkeyNode("cache-0-0", "data")
+	node.Labels = map[string]string{
+		LabelValkey:    "cache",
+		LabelNodeIndex: "0",
+	}
+	svc := buildValkeyNodeService(node)
+
+	// Service name matches valkeyNodeResourceName so SS hostname resolves through it.
+	assert.Equal(t, "valkey-cache-0-0", svc.Name)
+	assert.Equal(t, "data", svc.Namespace)
+
+	// Headless so Sentinel resolves to the pod IP directly, not a VIP.
+	assert.Equal(t, corev1.ServiceTypeClusterIP, svc.Spec.Type)
+	assert.Equal(t, headlessClusterIP, svc.Spec.ClusterIP)
+
+	// Sentinel needs to reach the pod even when briefly NotReady during failover.
+	assert.True(t, svc.Spec.PublishNotReadyAddresses)
+
+	// Selector picks exactly the single pod backing this ValkeyNode.
+	assert.Equal(t, "cache", svc.Spec.Selector[LabelValkey])
+	assert.Equal(t, "0", svc.Spec.Selector[LabelNodeIndex])
+
+	require.Len(t, svc.Spec.Ports, 1)
+	assert.Equal(t, int32(DefaultPort), svc.Spec.Ports[0].Port)
+	assert.Equal(t, corev1.ProtocolTCP, svc.Spec.Ports[0].Protocol)
+}
+
 func TestBuildValkeyNodePodTemplateSpec(t *testing.T) {
 	node := newTestValkeyNode("mynode", "test-ns")
 	lbls := valkeyNodeLabels(node)
@@ -75,8 +111,8 @@ func TestBuildValkeyNodePodTemplateSpec(t *testing.T) {
 	// Image
 	assert.Equal(t, "valkey/valkey:9.0.0", c.Image)
 
-	// Command
-	assert.Equal(t, []string{"valkey-server", "/config/valkey.conf"}, c.Command)
+	// Command - launched from the writable config copy so CONFIG REWRITE works.
+	assert.Equal(t, []string{"valkey-server", "/etc/valkey/valkey.conf"}, c.Command)
 
 	// Ports
 	require.Len(t, c.Ports, 2)
@@ -110,20 +146,29 @@ func TestBuildValkeyNodePodTemplateSpec(t *testing.T) {
 	assert.Contains(t, c.ReadinessProbe.Exec.Command, "/scripts/readiness-check.sh")
 
 	// VolumeMounts
-	require.Len(t, c.VolumeMounts, 2)
+	require.Len(t, c.VolumeMounts, 3)
 	assert.Equal(t, "scripts", c.VolumeMounts[0].Name)
 	assert.Equal(t, "/scripts", c.VolumeMounts[0].MountPath)
 	assert.Equal(t, "valkey-conf", c.VolumeMounts[1].Name)
 	assert.Equal(t, "/config", c.VolumeMounts[1].MountPath)
 	assert.True(t, c.VolumeMounts[1].ReadOnly, "valkey-conf mount should be read-only")
+	assert.Equal(t, writableConfigVolumeName, c.VolumeMounts[2].Name)
+	assert.Equal(t, writableConfigPath, c.VolumeMounts[2].MountPath)
+	assert.False(t, c.VolumeMounts[2].ReadOnly, "writable config mount must be writable")
 
 	// Volumes
-	require.Len(t, pts.Spec.Volumes, 2)
+	require.Len(t, pts.Spec.Volumes, 3)
 	assert.Equal(t, "scripts", pts.Spec.Volumes[0].Name)
 	assert.Equal(t, "valkey-config", pts.Spec.Volumes[0].ConfigMap.Name)
 	assert.Equal(t, int32(0755), *pts.Spec.Volumes[0].ConfigMap.DefaultMode)
 	assert.Equal(t, "valkey-conf", pts.Spec.Volumes[1].Name)
 	assert.Equal(t, "valkey-config", pts.Spec.Volumes[1].ConfigMap.Name)
+	assert.Equal(t, writableConfigVolumeName, pts.Spec.Volumes[2].Name)
+	require.NotNil(t, pts.Spec.Volumes[2].EmptyDir, "writable config volume must be an emptyDir")
+
+	// config-init populates the writable copy before the server starts.
+	require.Len(t, pts.Spec.InitContainers, 1)
+	assert.Equal(t, "config-init", pts.Spec.InitContainers[0].Name)
 }
 
 func TestBuildValkeyNodeDeployment(t *testing.T) {
@@ -171,6 +216,50 @@ func TestBuildValkeyNodeStatefulSet(t *testing.T) {
 	// Verify the template has the right container
 	require.Len(t, ss.Spec.Template.Spec.Containers, 1)
 	assert.Equal(t, "server", ss.Spec.Template.Spec.Containers[0].Name)
+
+	// OnDelete updateStrategy: the operator drives pod replacement order
+	// during rolling restarts, not the StatefulSet controller.
+	assert.Equal(t, appsv1.OnDeleteStatefulSetStrategyType, ss.Spec.UpdateStrategy.Type)
+
+	// Stability: building twice must produce DeepEqual specs, AND the
+	// commonly API-server-defaulted fields must be pre-populated so
+	// controllerutil.CreateOrUpdate is a no-op in steady state. Without
+	// this the SS spec flaps every reconcile, bumping updateRevision and
+	// fooling the rollout observer into thinking every pod is pending.
+	ss2, err := buildValkeyNodeStatefulSet(node)
+	require.NoError(t, err)
+	assert.True(t, equality.Semantic.DeepEqual(ss.Spec, ss2.Spec),
+		"SS spec must be stable across builds (otherwise CreateOrUpdate flaps every reconcile)")
+
+	// Specific defaults the API server would otherwise apply on UPDATE.
+	require.NotNil(t, ss.Spec.RevisionHistoryLimit)
+	assert.Equal(t, int32(10), *ss.Spec.RevisionHistoryLimit)
+	assert.Equal(t, appsv1.OrderedReadyPodManagement, ss.Spec.PodManagementPolicy)
+
+	pod := ss.Spec.Template.Spec
+	assert.Equal(t, corev1.RestartPolicyAlways, pod.RestartPolicy)
+	assert.Equal(t, corev1.DNSClusterFirst, pod.DNSPolicy)
+	assert.Equal(t, corev1.DefaultSchedulerName, pod.SchedulerName)
+	require.NotNil(t, pod.TerminationGracePeriodSeconds)
+	assert.Equal(t, int64(30), *pod.TerminationGracePeriodSeconds)
+	require.NotNil(t, pod.SecurityContext)
+
+	c := pod.Containers[0]
+	assert.Equal(t, corev1.TerminationMessagePathDefault, c.TerminationMessagePath)
+	assert.Equal(t, corev1.TerminationMessageReadFile, c.TerminationMessagePolicy)
+	// The default image tag is "9.0.0" (newTestValkeyNode), not :latest -> IfNotPresent.
+	assert.Equal(t, corev1.PullIfNotPresent, c.ImagePullPolicy)
+
+	// Every ConfigMap/Secret volume must have DefaultMode set (otherwise
+	// the API server defaults it on UPDATE and we get a diff).
+	for _, v := range pod.Volumes {
+		if v.ConfigMap != nil {
+			assert.NotNil(t, v.ConfigMap.DefaultMode, "ConfigMap volume %q missing DefaultMode", v.Name)
+		}
+		if v.Secret != nil {
+			assert.NotNil(t, v.Secret.DefaultMode, "Secret volume %q missing DefaultMode", v.Name)
+		}
+	}
 }
 
 func TestBuildValkeyNodePVC(t *testing.T) {
@@ -368,15 +457,220 @@ func TestBuildValkeyNodePodTemplateSpec_WithPersistence(t *testing.T) {
 	pts, err := buildValkeyNodePodTemplateSpec(node, valkeyNodeLabels(node))
 	require.NoError(t, err)
 
-	require.Len(t, pts.Spec.Volumes, 3)
-	assert.Equal(t, dataVolumeName, pts.Spec.Volumes[2].Name)
-	require.NotNil(t, pts.Spec.Volumes[2].PersistentVolumeClaim)
-	assert.Equal(t, "valkey-mynode-data", pts.Spec.Volumes[2].PersistentVolumeClaim.ClaimName)
+	require.Len(t, pts.Spec.Volumes, 4)
+	assert.Equal(t, dataVolumeName, pts.Spec.Volumes[3].Name)
+	require.NotNil(t, pts.Spec.Volumes[3].PersistentVolumeClaim)
+	assert.Equal(t, "valkey-mynode-data", pts.Spec.Volumes[3].PersistentVolumeClaim.ClaimName)
 
 	server := pts.Spec.Containers[0]
-	require.Len(t, server.VolumeMounts, 3)
-	assert.Equal(t, dataVolumeName, server.VolumeMounts[2].Name)
-	assert.Equal(t, dataMountPath, server.VolumeMounts[2].MountPath)
+	require.Len(t, server.VolumeMounts, 4)
+	assert.Equal(t, dataVolumeName, server.VolumeMounts[3].Name)
+	assert.Equal(t, dataMountPath, server.VolumeMounts[3].MountPath)
+}
+
+// PersistWritableConfig=true must drop the inline emptyDir volume entry
+// for the writable-config volume - the volume comes from the StatefulSet's
+// VolumeClaimTemplates instead. Without this gate, the SS would carry both
+// an inline Volume AND a VCT entry with the same name and the API server
+// would reject the apply.
+func TestBuildValkeyNodePodTemplateSpec_PersistWritableConfig_OmitsInlineEmptyDir(t *testing.T) {
+	node := newTestValkeyNode("mynode", "test-ns")
+	node.Spec.PersistWritableConfig = true
+
+	pts, err := buildValkeyNodePodTemplateSpec(node, valkeyNodeLabels(node))
+	require.NoError(t, err)
+
+	for _, v := range pts.Spec.Volumes {
+		assert.NotEqualf(t, writableConfigVolumeName, v.Name,
+			"writable-config volume must come from VolumeClaimTemplates when PersistWritableConfig is set, not from an inline emptyDir")
+	}
+
+	// The server container must still mount the writable-config volume -
+	// without the mount, valkey-server can't read its config from a
+	// writable path and CONFIG REWRITE fails with "Read-only file system".
+	server := pts.Spec.Containers[0]
+	var mounted bool
+	for _, m := range server.VolumeMounts {
+		if m.Name == writableConfigVolumeName {
+			mounted = true
+			break
+		}
+	}
+	assert.True(t, mounted, "server container must mount %s even when PersistWritableConfig is set", writableConfigVolumeName)
+}
+
+// PersistWritableConfig=false (the ValkeyCluster path) must keep the inline
+// emptyDir volume entry so cluster-mode StatefulSets that already exist
+// continue to reconcile cleanly. This is the regression test for the
+// VolumeClaimTemplates immutability guard: ValkeyCluster never sets the
+// flag and so never tries to retrofit a VCT entry into an existing SS.
+func TestBuildValkeyNodePodTemplateSpec_DefaultUsesEmptyDirWritableConfig(t *testing.T) {
+	node := newTestValkeyNode("mynode", "test-ns")
+	require.False(t, node.Spec.PersistWritableConfig)
+
+	pts, err := buildValkeyNodePodTemplateSpec(node, valkeyNodeLabels(node))
+	require.NoError(t, err)
+
+	var found *corev1.Volume
+	for i := range pts.Spec.Volumes {
+		if pts.Spec.Volumes[i].Name == writableConfigVolumeName {
+			found = &pts.Spec.Volumes[i]
+			break
+		}
+	}
+	require.NotNil(t, found, "writable-config emptyDir volume must remain when PersistWritableConfig is unset")
+	require.NotNil(t, found.EmptyDir, "writable-config volume must be an emptyDir on the legacy path")
+}
+
+// PersistWritableConfig=true must add a VolumeClaimTemplates entry named
+// writableConfigVolumeName. The StatefulSet controller stamps a unique PVC
+// per pod from this template; that PVC is what preserves the REPLICAOF
+// directive across pod cycles.
+func TestBuildValkeyNodeStatefulSet_PersistWritableConfig_AddsVCT(t *testing.T) {
+	node := newTestValkeyNode("mynode", "test-ns")
+	node.Spec.PersistWritableConfig = true
+
+	ss, err := buildValkeyNodeStatefulSet(node)
+	require.NoError(t, err)
+
+	require.Len(t, ss.Spec.VolumeClaimTemplates, 1, "PersistWritableConfig must stamp exactly one VCT entry")
+	vct := ss.Spec.VolumeClaimTemplates[0]
+	assert.Equal(t, writableConfigVolumeName, vct.Name)
+	require.Len(t, vct.Spec.AccessModes, 1)
+	assert.Equal(t, corev1.ReadWriteOnce, vct.Spec.AccessModes[0])
+	assert.Equal(t, writableConfigPVCSize, vct.Spec.Resources.Requests[corev1.ResourceStorage])
+
+	// Stability: building twice must produce DeepEqual specs. Without
+	// this the SS spec flaps every reconcile, bumping updateRevision
+	// and tripping the rollout observer. Same guard the base
+	// TestBuildValkeyNodeStatefulSet applies, repeated here so the
+	// writable-config VCT path is covered.
+	ss2, err := buildValkeyNodeStatefulSet(node)
+	require.NoError(t, err)
+	assert.True(t, equality.Semantic.DeepEqual(ss.Spec, ss2.Spec),
+		"SS spec with PersistWritableConfig must be stable across builds")
+}
+
+// Default ValkeyNode (PersistWritableConfig unset, no data persistence)
+// must produce a StatefulSet with no VolumeClaimTemplates at all -
+// otherwise existing ValkeyCluster StatefulSets would fail to reconcile
+// once this branch lands. This is the bright-line guard between the new
+// behavior and ValkeyCluster's existing emptyDir-based path.
+func TestBuildValkeyNodeStatefulSet_DefaultHasNoVCT(t *testing.T) {
+	node := newTestValkeyNode("mynode", "test-ns")
+	require.False(t, node.Spec.PersistWritableConfig)
+	require.Nil(t, node.Spec.Persistence)
+
+	ss, err := buildValkeyNodeStatefulSet(node)
+	require.NoError(t, err)
+
+	assert.Empty(t, ss.Spec.VolumeClaimTemplates,
+		"default ValkeyNode must not stamp any VCT entries (ValkeyCluster relies on this for SS reconcile stability)")
+}
+
+// The config-init script must preserve a REPLICAOF directive captured in
+// the previous boot's writable valkey.conf and re-append it after copying
+// the fresh ConfigMap body in. Without this, a replica's pod cycle
+// produces a transient master that the operator's recovery path has to
+// re-wire - the multi-master window Option B is meant to eliminate.
+func TestConfigInitScript_PreservesReplicaof(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, os.MkdirAll(dir+"/etc-valkey", 0o755))
+	require.NoError(t, os.MkdirAll(dir+"/config", 0o755))
+
+	// Seed the writable file as if a previous CONFIG REWRITE had run -
+	// it has the replicaof line we expect to survive.
+	prevContents := "maxmemory 256mb\nreplicaof valkey-1.example.svc 6379\n"
+	require.NoError(t, os.WriteFile(dir+"/etc-valkey/valkey.conf", []byte(prevContents), 0o644))
+	// Seed the ConfigMap with a fresh body (no replicaof).
+	freshContents := "maxmemory 512mb\nappendonly yes\n"
+	require.NoError(t, os.WriteFile(dir+"/config/valkey.conf", []byte(freshContents), 0o644))
+
+	// Run the init script with the in-script CONF_DIR pinned at the
+	// temp dir so we don't need to touch /etc/valkey on the host.
+	script := strings.Replace(configInitScript,
+		"CONF_DIR="+writableConfigPath,
+		"CONF_DIR="+dir+"/etc-valkey", 1)
+	script = strings.Replace(script,
+		"cp /config/valkey.conf",
+		"cp "+dir+"/config/valkey.conf", 1)
+
+	cmd := exec.Command("sh", "-c", script)
+	out, err := cmd.CombinedOutput()
+	require.NoError(t, err, "init script failed: %s", string(out))
+
+	got, err := os.ReadFile(dir + "/etc-valkey/valkey.conf")
+	require.NoError(t, err)
+
+	// Fresh ConfigMap content is present.
+	assert.Contains(t, string(got), "maxmemory 512mb",
+		"init script must replace the body with the fresh ConfigMap contents")
+	assert.Contains(t, string(got), "appendonly yes",
+		"init script must propagate every ConfigMap directive, not just maxmemory")
+	// Replicaof line is preserved.
+	assert.Contains(t, string(got), "replicaof valkey-1.example.svc 6379",
+		"init script must re-append the previously-persisted replicaof directive so the pod boots back into its replica role")
+	// The stale maxmemory value is NOT preserved - only replicaof is.
+	assert.NotContains(t, string(got), "256mb",
+		"init script must not preserve non-replication directives - ConfigMap is the source of truth for everything else")
+}
+
+// VolumeClaimTemplates is immutable after SS creation. The reconcile
+// path must refuse to enable PersistWritableConfig on an existing SS
+// that doesn't have the writable-config VCT - and must refuse the
+// reverse toggle too. Without this guard the next Update would fail
+// with an opaque immutable-field error from the API server.
+func TestAssertWritableConfigImmutable(t *testing.T) {
+	withoutVCT := &appsv1.StatefulSet{Spec: appsv1.StatefulSetSpec{}}
+	withVCT := &appsv1.StatefulSet{Spec: appsv1.StatefulSetSpec{
+		VolumeClaimTemplates: []corev1.PersistentVolumeClaim{
+			{ObjectMeta: metav1.ObjectMeta{Name: writableConfigVolumeName}},
+		},
+	}}
+
+	t.Run("no-op when both lack the VCT", func(t *testing.T) {
+		assert.NoError(t, assertWritableConfigImmutable(withoutVCT, withoutVCT))
+	})
+	t.Run("no-op when both carry the VCT", func(t *testing.T) {
+		assert.NoError(t, assertWritableConfigImmutable(withVCT, withVCT))
+	})
+	t.Run("rejects enabling on existing SS", func(t *testing.T) {
+		err := assertWritableConfigImmutable(withoutVCT, withVCT)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "cannot enable writable-config persistence")
+	})
+	t.Run("rejects disabling on existing SS", func(t *testing.T) {
+		err := assertWritableConfigImmutable(withVCT, withoutVCT)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "cannot disable writable-config persistence")
+	})
+}
+
+// First-boot path: no existing writable file. The init script must
+// simply seed the file from the ConfigMap without erroring on the
+// missing-replicaof case.
+func TestConfigInitScript_FirstBoot(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, os.MkdirAll(dir+"/etc-valkey", 0o755))
+	require.NoError(t, os.MkdirAll(dir+"/config", 0o755))
+	require.NoError(t, os.WriteFile(dir+"/config/valkey.conf",
+		[]byte("maxmemory 256mb\n"), 0o644))
+
+	script := strings.Replace(configInitScript,
+		"CONF_DIR="+writableConfigPath,
+		"CONF_DIR="+dir+"/etc-valkey", 1)
+	script = strings.Replace(script,
+		"cp /config/valkey.conf",
+		"cp "+dir+"/config/valkey.conf", 1)
+
+	cmd := exec.Command("sh", "-c", script)
+	out, err := cmd.CombinedOutput()
+	require.NoError(t, err, "init script failed on first boot: %s", string(out))
+
+	got, err := os.ReadFile(dir + "/etc-valkey/valkey.conf")
+	require.NoError(t, err)
+	assert.Contains(t, string(got), "maxmemory 256mb")
+	assert.NotContains(t, string(got), "replicaof")
 }
 
 func TestBuildContainersDef_DefaultImage(t *testing.T) {
@@ -563,17 +857,17 @@ func TestBuildValkeyNodePodTemplateSpec_WithACLSecret(t *testing.T) {
 	pts, err := buildValkeyNodePodTemplateSpec(node, valkeyNodeLabels(node))
 	require.NoError(t, err)
 
-	// Volumes: scripts, valkey-conf, users-acl
-	require.Len(t, pts.Spec.Volumes, 3)
-	aclVol := pts.Spec.Volumes[2]
+	// Volumes: scripts, valkey-conf, valkey-conf-writable, users-acl
+	require.Len(t, pts.Spec.Volumes, 4)
+	aclVol := pts.Spec.Volumes[3]
 	assert.Equal(t, "users-acl", aclVol.Name)
 	require.NotNil(t, aclVol.Secret)
 	assert.Equal(t, "mynode-internal", aclVol.Secret.SecretName)
 
 	// VolumeMounts on the server container (always Containers[0])
 	c := pts.Spec.Containers[0]
-	require.Len(t, c.VolumeMounts, 3)
-	aclMount := c.VolumeMounts[2]
+	require.Len(t, c.VolumeMounts, 4)
+	aclMount := c.VolumeMounts[3]
 	assert.Equal(t, "users-acl", aclMount.Name)
 	assert.Equal(t, "/config/users", aclMount.MountPath)
 	assert.True(t, aclMount.ReadOnly)
@@ -585,8 +879,8 @@ func TestBuildValkeyNodePodTemplateSpec_WithoutACLSecret(t *testing.T) {
 	pts, err := buildValkeyNodePodTemplateSpec(node, valkeyNodeLabels(node))
 	require.NoError(t, err)
 
-	require.Len(t, pts.Spec.Volumes, 2, "should only have scripts and valkey-conf volumes")
-	require.Len(t, pts.Spec.Containers[0].VolumeMounts, 2, "should only have scripts and valkey-conf mounts")
+	require.Len(t, pts.Spec.Volumes, 3, "should have scripts, valkey-conf, and writable-config volumes")
+	require.Len(t, pts.Spec.Containers[0].VolumeMounts, 3, "should have scripts, valkey-conf, and writable-config mounts")
 }
 
 func TestLivenessCheckScript(t *testing.T) {
