@@ -4,44 +4,40 @@ kind: CustomResourceDefinition
 metadata:
   annotations:
     controller-gen.kubebuilder.io/version: v0.20.1
-  name: valkeynodes.valkey.io
+  name: valkeysentinels.valkey.io
 spec:
   group: valkey.io
   names:
-    kind: ValkeyNode
-    listKind: ValkeyNodeList
-    plural: valkeynodes
-    singular: valkeynode
+    kind: ValkeySentinel
+    listKind: ValkeySentinelList
+    plural: valkeysentinels
+    shortNames:
+    - vks
+    singular: valkeysentinel
   scope: Namespaced
   versions:
   - additionalPrinterColumns:
-    - description: Whether the node is ready
-      jsonPath: .status.ready
+    - jsonPath: .status.state
+      name: State
+      type: string
+    - jsonPath: .spec.replicas
+      name: Replicas
+      type: integer
+    - jsonPath: .status.readyReplicas
       name: Ready
-      type: boolean
-    - description: Valkey replication role
-      jsonPath: .status.role
-      name: Role
-      type: string
-    - description: Pod name
-      jsonPath: .status.podName
-      name: Pod
-      type: string
-    - description: Pod IP
-      jsonPath: .status.podIP
-      name: IP
       priority: 1
+      type: integer
+    - description: Valkeys currently monitored by this sentinel set
+      jsonPath: .status.monitored[*]
+      name: Monitored
       type: string
-    - description: Time since creation
-      jsonPath: .metadata.creationTimestamp
+    - jsonPath: .metadata.creationTimestamp
       name: Age
       type: date
     name: v1alpha1
     schema:
       openAPIV3Schema:
-        description: |-
-          ValkeyNode is the Schema for the valkeynodes API.
-          ValkeyNode is an internal CRD. Users should not create ValkeyNodes directly.
+        description: ValkeySentinel is the Schema for the valkeysentinels API.
         properties:
           apiVersion:
             description: |-
@@ -61,10 +57,18 @@ spec:
           metadata:
             type: object
           spec:
-            description: ValkeyNodeSpec defines the desired state of ValkeyNode.
+            description: |-
+              ValkeySentinelSpec defines the desired state of a ValkeySentinel.
+
+              A ValkeySentinel runs a standalone set of Valkey Sentinel processes
+              that monitor every Valkey in the same namespace whose labels match
+              `spec.valkeySelector`. The link is one-way: sentinels pick their
+              targets; the data side is unaware.
             properties:
               affinity:
-                description: Affinity defines the pod affinity/anti-affinity rules.
+                description: |-
+                  Affinity applied to every sentinel pod. Anti-affine the set across
+                  hosts or zones so a node failure does not take the whole set down.
                 properties:
                   nodeAffinity:
                     description: Describes node affinity scheduling rules for the
@@ -975,11 +979,18 @@ spec:
                         x-kubernetes-list-type: atomic
                     type: object
                 type: object
-              containers:
+              config:
+                additionalProperties:
+                  type: string
                 description: |-
-                  Containers allows patching the default containers via a strategic merge
-                  patch. Existing containers (e.g. "server", "metrics-exporter") are merged
-                  by name; any container name not present in the defaults is appended.
+                  Config is passthrough configuration applied via
+                  `SENTINEL SET <master> <key> <value>` to every monitored master.
+                  Common keys: `down-after-milliseconds`, `failover-timeout`,
+                  `parallel-syncs`. The operator does not validate option names.
+                type: object
+              containers:
+                description: Containers patches the pod's container list via strategic
+                  merge.
                 items:
                   description: A single application container that you want to run
                     within a pod.
@@ -2501,118 +2512,34 @@ spec:
                   - name
                   type: object
                 type: array
-              exporter:
-                description: Exporter defines the metrics exporter sidecar configuration.
-                properties:
-                  enabled:
-                    description: Enable or disable the exporter sidecar container
-                    type: boolean
-                  image:
-                    description: Override the default exporter image
-                    type: string
-                  resources:
-                    description: Override resource requirements for the exporter container
-                      in each pod
-                    properties:
-                      claims:
-                        description: |-
-                          Claims lists the names of resources, defined in spec.resourceClaims,
-                          that are used by this container.
-
-                          This field depends on the
-                          DynamicResourceAllocation feature gate.
-
-                          This field is immutable. It can only be set for containers.
-                        items:
-                          description: ResourceClaim references one entry in PodSpec.ResourceClaims.
-                          properties:
-                            name:
-                              description: |-
-                                Name must match the name of one entry in pod.spec.resourceClaims of
-                                the Pod where this field is used. It makes that resource available
-                                inside a container.
-                              type: string
-                            request:
-                              description: |-
-                                Request is the name chosen for a request in the referenced claim.
-                                If empty, everything from the claim is made available, otherwise
-                                only the result of this request.
-                              type: string
-                          required:
-                          - name
-                          type: object
-                        type: array
-                        x-kubernetes-list-map-keys:
-                        - name
-                        x-kubernetes-list-type: map
-                      limits:
-                        additionalProperties:
-                          anyOf:
-                          - type: integer
-                          - type: string
-                          pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
-                          x-kubernetes-int-or-string: true
-                        description: |-
-                          Limits describes the maximum amount of compute resources allowed.
-                          More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
-                        type: object
-                      requests:
-                        additionalProperties:
-                          anyOf:
-                          - type: integer
-                          - type: string
-                          pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
-                          x-kubernetes-int-or-string: true
-                        description: |-
-                          Requests describes the minimum amount of compute resources required.
-                          If Requests is omitted for a container, it defaults to Limits if that is explicitly specified,
-                          otherwise to an implementation-defined value. Requests cannot exceed Limits.
-                          More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
-                        type: object
-                    type: object
-                type: object
               image:
-                description: Image is the Valkey container image to use.
+                description: Image overrides the container image used for the sentinel
+                  pods.
                 type: string
               nodeSelector:
                 additionalProperties:
                   type: string
-                description: NodeSelector defines the node selection constraints.
+                description: NodeSelector applied to every sentinel pod.
                 type: object
-              persistWritableConfig:
-                description: |-
-                  PersistWritableConfig opts the writable copy of valkey.conf into a
-                  VolumeClaimTemplate-backed PVC instead of an emptyDir. CONFIG
-                  REWRITE - issued every time the operator (or Sentinel) wires up
-                  replication on a pod - persists directives to the writable file.
-                  With emptyDir the file is wiped on pod recreation, so a cycled
-                  replica boots as a master until the operator's recovery path
-                  re-issues REPLICAOF; persisting the writable file eliminates that
-                  transient multi-master window entirely.
-
-                  Set automatically by the Valkey (replication) controller.
-                  ValkeyCluster does NOT set it: cluster mode's role state lives in
-                  nodes.conf on the data PVC, so writable-config persistence buys
-                  nothing there and adding a new VolumeClaimTemplates entry to
-                  existing ValkeyCluster StatefulSets would fail (VCT is immutable
-                  after creation).
-
-                  This field is immutable after creation for the same reason: the
-                  ValkeyNode controller refuses to toggle persistence on an
-                  existing StatefulSet to keep error surfaces visible. Recreate the
-                  parent CR to switch modes.
-                type: boolean
-                x-kubernetes-validations:
-                - message: persistWritableConfig is immutable
-                  rule: self == oldSelf
               persistence:
-                description: Persistence defines durable storage for the ValkeyNode.
+                description: |-
+                  Persistence configures durable storage for sentinel.conf. The
+                  operator provisions a small per-pod PVC by default; see
+                  SentinelPersistenceSpec for the rationale and how to opt out.
                 properties:
+                  disabled:
+                    description: |-
+                      Disabled, when true, falls back to a disk-backed emptyDir. Use
+                      this only on clusters without a default StorageClass or when
+                      sentinel state loss across pod recreations is acceptable.
+                    type: boolean
                   reclaimPolicy:
                     default: Retain
                     description: |-
-                      ReclaimPolicy controls whether the managed PVC is retained or deleted when
-                      the ValkeyNode is deleted. Defaults to Retain.
+                      ReclaimPolicy controls whether the managed PVCs are retained or
+                      deleted when the ValkeySentinel is deleted. Defaults to Retain
+                      since sentinel state is tiny and re-using an existing PVC
+                      during pod re-creation is the entire reason for the PVC.
                     enum:
                     - Retain
                     - Delete
@@ -2621,19 +2548,44 @@ spec:
                     anyOf:
                     - type: integer
                     - type: string
-                    description: Size is the requested PVC size.
+                    description: |-
+                      Size is the requested PVC size. Defaults to 100Mi when unset
+                      and Disabled is false. sentinel.conf is small (a few KB per
+                      monitored master) so this is conservative.
                     pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
                     x-kubernetes-int-or-string: true
                   storageClassName:
-                    description: StorageClassName is the storage class to use for
-                      the PVC.
+                    description: StorageClassName uses the cluster's default StorageClass
+                      when nil.
                     type: string
-                required:
-                - size
                 type: object
+              podDisruptionBudget:
+                default: Managed
+                description: PodDisruptionBudget controls whether the operator manages
+                  a PDB.
+                enum:
+                - Managed
+                - Disabled
+                type: string
+              quorum:
+                description: |-
+                  Quorum is the number of sentinels that must agree the primary is
+                  subjectively down before a failover is triggered. Defaults to
+                  floor(replicas/2)+1 (a strict majority). Must be ≤ replicas.
+                format: int32
+                minimum: 1
+                type: integer
+              replicas:
+                description: |-
+                  Replicas is the number of sentinel pods. Minimum is 3 so a single
+                  pod loss still leaves a quorum.
+                format: int32
+                minimum: 3
+                type: integer
               resources:
-                description: Resources defines the resource requirements for the Valkey
-                  container.
+                description: |-
+                  Resources defines the resource requirements for the sentinel
+                  container. Sentinels are lightweight; defaults are intentionally low.
                 properties:
                   claims:
                     description: |-
@@ -2691,20 +2643,10 @@ spec:
                       More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
                     type: object
                 type: object
-              serverConfigHash:
-                description: |-
-                  ServerConfigHash is a hash of the server ConfigMap contents. When set by
-                  the ValkeyCluster controller it bumps the spec Generation, which triggers
-                  the ValkeyNode controller to reconcile and update the pod template
-                  annotation — causing a rolling restart when the cluster config changes.
-                type: string
-              serverConfigMapName:
-                description: |-
-                  ServerConfigMapName specifies the name of the ConfigMap that contains the
-                  scripts, and Valkey config for the ValkeyNode.
-                type: string
               tls:
-                description: TLS configuration for the node
+                description: |-
+                  TLS configuration for the sentinel port. Currently not
+                  implemented; setting this produces a non-functional set.
                 properties:
                   certificate:
                     description: |-
@@ -2721,7 +2663,7 @@ spec:
                     type: object
                 type: object
               tolerations:
-                description: Tolerations defines the pod tolerations.
+                description: Tolerations applied to every sentinel pod.
                 items:
                   description: |-
                     The pod this Toleration is attached to tolerates any taint that matches
@@ -2760,48 +2702,72 @@ spec:
                       type: string
                   type: object
                 type: array
-              usersACLSecretName:
+              valkeySelector:
                 description: |-
-                  UsersACLSecretName is the name of the Secret containing the ACL user
-                  file. When set, mounts a users-acl volume from this Secret so the
-                  container can load aclfile /config/users/users.acl.
-                type: string
-              workloadType:
-                default: StatefulSet
-                description: |-
-                  WorkloadType specifies whether to create a StatefulSet or Deployment.
-                  This field is immutable after creation.
-                enum:
-                - StatefulSet
-                - Deployment
-                type: string
-                x-kubernetes-validations:
-                - message: workloadType is immutable
-                  rule: self == oldSelf
+                  ValkeySelector picks the Valkey resources this sentinel set will
+                  monitor. Same namespace only. An empty selector matches no
+                  Valkeys (use an explicit `matchLabels` / `matchExpressions`).
+                properties:
+                  matchExpressions:
+                    description: matchExpressions is a list of label selector requirements.
+                      The requirements are ANDed.
+                    items:
+                      description: |-
+                        A label selector requirement is a selector that contains values, a key, and an operator that
+                        relates the key and values.
+                      properties:
+                        key:
+                          description: key is the label key that the selector applies
+                            to.
+                          type: string
+                        operator:
+                          description: |-
+                            operator represents a key's relationship to a set of values.
+                            Valid operators are In, NotIn, Exists and DoesNotExist.
+                          type: string
+                        values:
+                          description: |-
+                            values is an array of string values. If the operator is In or NotIn,
+                            the values array must be non-empty. If the operator is Exists or DoesNotExist,
+                            the values array must be empty. This array is replaced during a strategic
+                            merge patch.
+                          items:
+                            type: string
+                          type: array
+                          x-kubernetes-list-type: atomic
+                      required:
+                      - key
+                      - operator
+                      type: object
+                    type: array
+                    x-kubernetes-list-type: atomic
+                  matchLabels:
+                    additionalProperties:
+                      type: string
+                    description: |-
+                      matchLabels is a map of {key,value} pairs. A single {key,value} in the matchLabels
+                      map is equivalent to an element of matchExpressions, whose key field is "key", the
+                      operator is "In", and the values array contains only "value". The requirements are ANDed.
+                    type: object
+                type: object
+                x-kubernetes-map-type: atomic
+            required:
+            - replicas
+            - valkeySelector
             type: object
             x-kubernetes-validations:
-            - message: persistence requires workloadType StatefulSet
-              rule: '!(has(self.persistence) && self.workloadType == ''Deployment'')'
-            - message: persistWritableConfig requires workloadType StatefulSet
-              rule: '!(has(self.persistWritableConfig) && self.persistWritableConfig
-                && self.workloadType == ''Deployment'')'
-            - message: persistence cannot be removed once set
-              rule: '!has(oldSelf.persistence) || has(self.persistence)'
-            - message: persistence cannot be added after creation
-              rule: has(oldSelf.persistence) || !has(self.persistence)
-            - message: persistence.size may only be expanded
-              rule: '!has(self.persistence) || !has(oldSelf.persistence) || quantity(self.persistence.size).compareTo(quantity(oldSelf.persistence.size))
-                >= 0'
-            - message: persistence.storageClassName is immutable
-              rule: '!has(self.persistence) || !has(oldSelf.persistence) || ((!has(self.persistence.storageClassName)
-                && !has(oldSelf.persistence.storageClassName)) || (has(self.persistence.storageClassName)
-                && has(oldSelf.persistence.storageClassName) && self.persistence.storageClassName
-                == oldSelf.persistence.storageClassName))'
+            - message: quorum must be <= replicas
+              rule: '!has(self.quorum) || self.quorum <= self.replicas'
           status:
-            description: ValkeyNodeStatus defines the observed state of ValkeyNode.
+            default:
+              readyReplicas: 0
+              state: Initializing
+            description: ValkeySentinelStatus defines the observed state of a ValkeySentinel.
             properties:
               conditions:
-                description: Conditions represent the current state of the ValkeyNode.
+                description: |-
+                  Conditions exposes detailed state.
+                  Standard types: Ready, Progressing.
                 items:
                   description: Condition contains details for one aspect of the current
                     state of this API Resource.
@@ -2860,30 +2826,70 @@ spec:
                 x-kubernetes-list-map-keys:
                 - type
                 x-kubernetes-list-type: map
-              observedGeneration:
+              endpoints:
                 description: |-
-                  ObservedGeneration is the most recent generation observed by the controller.
-                  It corresponds to the ValkeyNode's generation, which is updated on mutation
-                  of the spec field.
-                format: int64
+                  Endpoints is the per-pod sentinel address list, ordered by pod
+                  index. Sentinel-aware clients accept a list and try each in
+                  order, so surfacing all of them avoids a hard dependency on any
+                  single sentinel being reachable for the bootstrap connect. The
+                  list reflects the desired replica count; entries appear before
+                  the matching pod is necessarily Ready, since the StatefulSet's
+                  DNS exists from creation.
+                items:
+                  description: |-
+                    Endpoint is a host:port pair observed by the operator. Host is a
+                    resolvable DNS name (a per-pod Service in the same namespace as the
+                    operator); Sentinel monitors data nodes by this name so pod-IP
+                    changes across restarts don't leave stale `known-replica` entries
+                    in sentinel.conf.
+                  properties:
+                    host:
+                      description: Host is a DNS name resolvable inside the cluster.
+                      type: string
+                    port:
+                      description: Port is the TCP port.
+                      format: int32
+                      type: integer
+                  required:
+                  - host
+                  - port
+                  type: object
+                type: array
+              message:
+                description: Message is a human-readable explanation of the current
+                  state.
+                type: string
+              monitored:
+                description: |-
+                  Monitored lists the Valkeys currently being monitored, intersected
+                  from the live `SENTINEL masters` output and the selector match.
+                  Sorted.
+                items:
+                  type: string
+                type: array
+                x-kubernetes-list-type: set
+              readyReplicas:
+                default: 0
+                description: ReadyReplicas is the number of sentinel pods reporting
+                  ready.
+                format: int32
                 type: integer
-              podIP:
-                description: PodIP is the IP address of the pod.
+              reason:
+                description: Reason is a brief machine-readable explanation of the
+                  current state.
                 type: string
-              podName:
-                description: PodName is the name of the pod created by the workload.
-                type: string
-              ready:
-                description: Ready indicates whether the ValkeyNode is ready to serve
-                  traffic.
-                type: boolean
-              role:
-                description: Role is the Valkey replication role of this node (primary
-                  or replica).
+              state:
+                default: Initializing
+                description: State summarises overall health.
+                enum:
+                - Initializing
+                - Reconciling
+                - Ready
+                - Degraded
+                - Failed
                 type: string
             type: object
         required:
-        - metadata
         - spec
         type: object
     served: true

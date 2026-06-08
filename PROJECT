@@ -21,4 +21,20 @@ resources:
   kind: ValkeyCluster
   path: valkey.io/valkey-operator/api/v1alpha1
   version: v1alpha1
+- api:
+    crdVersion: v1
+    namespaced: true
+  controller: true
+  domain: valkey.io
+  kind: Valkey
+  path: valkey.io/valkey-operator/api/v1alpha1
+  version: v1alpha1
+- api:
+    crdVersion: v1
+    namespaced: true
+  controller: true
+  domain: valkey.io
+  kind: ValkeySentinel
+  path: valkey.io/valkey-operator/api/v1alpha1
+  version: v1alpha1
 version: "3"
